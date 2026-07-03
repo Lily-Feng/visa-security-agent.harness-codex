@@ -42,7 +42,7 @@ do not develop or repair it.**
 
 ## Run it
 ```
-pipx install vvaharness            # or: pip install vvaharness
+pipx install .            # or: pip install .
 vvaharness setup                   # checks Python, agents, keys, gateway, config
 vvaharness scan --repo <path> --application-id <id>
 ```
