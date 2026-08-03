@@ -65,6 +65,12 @@ not currently accepting external code contributions; see
 [remediation.md](docs/remediation.md) · [validation.md](docs/validation.md) ·
 [Project Glasswing white paper](https://corporate.visa.com/content/dam/VCOM/corporate/visa-perspectives/security-and-trust/documents/project-glasswing.pdf) — technical background.
 
+**Fork companion guides:**
+[Enterprise Security Companion](enterprise-security/README.md) — host, runtime,
+cloud, identity, supply-chain, detection, response, and post-scan assurance ·
+[Codex-Only Direction](codex/README.md) — native Codex backend plan,
+authentication boundary, implementation milestones, efficiency, and safety.
+
 ---
 
 ## Quick start
