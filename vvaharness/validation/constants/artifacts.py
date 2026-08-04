@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Single source of truth for artifact names, DTO layout, markers, and environment keys."""
+"""Single source of truth for artifact names, DTO layout, and runtime environment keys."""
 
 from __future__ import annotations
 
@@ -64,7 +64,14 @@ SCAN_REPORT_GLOB: Final = "*_report.sarif"
 
 # Injected agent-config layout inside the workspace.
 CLAUDE_DIRNAME: Final = ".claude"
-SCORING_DIRNAME: Final = "scoring"
+# Backends that read the injected `.claude/` directory (a Claude-Agent-SDK
+# convention). Others receive the same rules inlined into their prompts.
+CLAUDE_CONFIG_BACKENDS: Final[tuple[str, ...]] = ("cli", "sdk")
+# Backends whose subagents return schema-validated reports, so the host can
+# synthesize gates from them deterministically. Elsewhere the orchestrator
+# synthesizes gates into its own structured response instead: the Claude SDK's
+# AgentDefinition carries no output schema, so its subagent reports are unvalidated.
+HOST_GATE_SYNTHESIS_BACKENDS: Final[tuple[str, ...]] = ("deepagents",)
 LOGGING_DIRNAME: Final = "logging"
 ORCHESTRATOR_LOG_DIRNAME: Final = "orchestrator"
 SUBAGENTS_LOG_DIRNAME: Final = "subagents"
@@ -78,20 +85,16 @@ ENV_CLAUDE_BINARY: Final = "VVAHARNESS_CLAUDE_BINARY"
 ENV_GHE_TOKEN: Final = "VVAHARNESS_GHE_TOKEN"  # noqa: S105
 ENV_GHE_ARCHIVED_TOKEN: Final = "VVAHARNESS_GHE_ARCHIVED_TOKEN"  # noqa: S105
 ENV_VIA: Final = "VVAHARNESS_VIA"
+ENV_MODEL_PROVIDER: Final = "VVAHARNESS_MODEL_PROVIDER"  # deepagents: openai|anthropic
 ENV_MAX_BUDGET_USD: Final = "VVAHARNESS_MAX_BUDGET_USD"
 ENV_MAX_FINDINGS: Final = "VVAHARNESS_MAX_FINDINGS"
 # Comma-separated reviewer-persona tool allow-list (step_validate.allowed_tools); unset → default.
 ENV_VALIDATE_TOOLS: Final = "VVAHARNESS_VALIDATE_TOOLS"
-# Optional per-persona model overrides for the s11 validator (unset → inherit VVAHARNESS_MODEL).
+# Per-persona model overrides: env var fallbacks (set by _EnvScalars; primary path is
+# the overrides dict).
 ENV_SECURITY_ARCHITECT_MODEL: Final = "VVAHARNESS_SECURITY_ARCHITECT_MODEL"
 ENV_PENETRATION_TESTER_MODEL: Final = "VVAHARNESS_PENETRATION_TESTER_MODEL"
 ENV_CROSS_REPO_ANALYZER_MODEL: Final = "VVAHARNESS_CROSS_REPO_ANALYZER_MODEL"
-# Persona sub-agent name → (profile models role, env var) for per-persona model wiring.
-PERSONA_MODEL_ENV: Final[dict[str, tuple[str, str]]] = {
-    "security-architect": ("validate_security_architect", ENV_SECURITY_ARCHITECT_MODEL),
-    "penetration-tester": ("validate_penetration_tester", ENV_PENETRATION_TESTER_MODEL),
-    "cross-repo-analyzer": ("validate_cross_repo_analyzer", ENV_CROSS_REPO_ANALYZER_MODEL),
-}
 
 # Agent-session environment contract (set on the launched validation session).
 SESSION_ENV_FLAG: Final = "VALIDATION_SESSION"
@@ -99,14 +102,26 @@ SESSION_ENV_TARGET_DIR: Final = "VALIDATION_TARGET_DIR"
 SESSION_ENV_OUTPUT_DIR: Final = "VALIDATION_OUTPUT_DIR"
 SESSION_ENV_MANIFEST: Final = "VALIDATION_MANIFEST"
 SESSION_ENV_LOG_DIR: Final = "VALIDATION_LOG_DIR"
+# Legacy environment name carrying the finding identifier. The validator has no
+# issue-tracker client and does not use it to fetch, comment, or transition tickets.
 SESSION_ENV_JIRA_KEY: Final = "JIRA_KEY"
 SESSION_ENV_SESSION_ID: Final = "SESSION_ID"
 SESSION_ENV_PROJECT_DIR: Final = "CLAUDE_PROJECT_DIR"
 SESSION_ENV_GH_TOKEN: Final = "GH_ENTERPRISE_TOKEN"  # noqa: S105
 SESSION_ENV_GH_ARCHIVED_TOKEN: Final = "GH_ARCHIVED_TOKEN"  # noqa: S105
 
-# Backend routing value rejected for the validate role (must be Anthropic).
+# Legacy backend routing value accepted for the validate role. Detection (S1-S9) and
+# report-only remediation serve it through the `backends/oai.py` dispatcher, which has
+# no agentic Harness implementation, so the validate role routes it to DeepAgents with
+# the OpenAI provider instead of refusing it. See validation.cli._model.
 BACKEND_OPENAI: Final = "openai"
+BACKEND_DEEPAGENTS: Final = "deepagents"
+
+# DeepAgents model-provider selectors. PROVIDER_OPENAI is the one paired with
+# BACKEND_OPENAI by that routing. The split is Anthropic vs everything else: any
+# provider that is not PROVIDER_ANTHROPIC resolves to an OpenAI-compatible endpoint.
+PROVIDER_OPENAI: Final = "openai"
+PROVIDER_ANTHROPIC: Final = "anthropic"
 
 # vvaharness CLI command token for the validation subcommand.
 VALIDATE_COMMAND: Final = "validate"
@@ -129,12 +144,12 @@ VALIDATION_SESSION_LOG_PREFIX: Final = "validation_session_"
 CMD_PREVIEW_LEN: Final = 80
 STDERR_TAIL_LINES: Final = 3
 
-# Default Claude agent runtime values (mirror ClaudeConfig defaults in config.settings).
+# Default agent runtime values (mirror AgentConfig defaults in config.settings).
 DEFAULT_CLAUDE_BINARY: Final = "claude"
 DEFAULT_MODEL: Final = "claude-opus-4-8[1m]"
 DEFAULT_MAX_TURNS: Final = 50
 DEFAULT_MAX_RETRIES: Final = 2
-DEFAULT_VIA: Final = "sdk"
+DEFAULT_VIA: Final = "deepagents"
 DEFAULT_MAX_BUDGET_USD: Final = 15.0
 DEFAULT_MAX_FINDINGS: Final = 20
 DEFAULT_EFFORT: Final = EffortLevel.HIGH

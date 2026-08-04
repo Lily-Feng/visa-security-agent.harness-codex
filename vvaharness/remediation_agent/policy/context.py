@@ -41,8 +41,8 @@ def _sr(cfg, key: str, default):
 def policy_enabled(cfg) -> bool:
     """Whether the policy gate / playbook are active for this run.
 
-    Defaults to OFF — the gate is strictly opt-in via
-    ``step_remediate.enforce_policy: true`` (all shipped profiles set it false)."""
+    The gate is controlled by ``step_remediate.enforce_policy``; shipped
+    profiles choose their own value."""
     return bool(_sr(cfg, "enforce_policy", False))
 
 

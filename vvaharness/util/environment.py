@@ -32,6 +32,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from vvaharness.backends.llm import DEEPAGENTS_ROLES
+from vvaharness.validation.cli._model import _validate_model_spec
+
 OK = "ok"
 WARN = "warn"
 FAIL = "fail"
@@ -54,7 +57,16 @@ def _looks_like_jwt(v: str | None) -> bool:
     """Claude Code / gateway session tokens are JWTs ('eyJ…'); a real Anthropic
     API key is 'sk-ant-…'. We only inspect the PREFIX shape, never log the
     value."""
-    return bool(v and v.startswith("eyJ"))
+    if not v:
+        return False
+    if v.startswith("eyJ"):
+        return True
+    # Some gateways issue opaque JWT-like session tokens that don't begin with
+    # eyJ but still follow the three-segment shape.
+    parts = v.split(".")
+    if len(parts) == 3 and v.startswith("ey"):
+        return all(bool(p) for p in parts)
+    return False
 
 
 # ── individual checks ──────────────────────────────────────────────────────────
@@ -132,19 +144,42 @@ def agent_checks() -> list[Check]:
     return out
 
 
-_DEPS = [("pydantic", True), ("yaml", True), ("anthropic", True),
-         ("openai", False)]
+# (module import name, required for baseline runtime)
+_DEPS = [
+    ("pydantic", True),
+    ("yaml", True),
+    ("anthropic", True),
+    ("tree_sitter", False),
+    ("tree_sitter_language_pack", False),
+    ("openai", False),
+]
 
 
 def dep_checks() -> list[Check]:
     out: list[Check] = []
     for mod, required in _DEPS:
         present = importlib.util.find_spec(mod) is not None
-        label = {"yaml": "PyYAML"}.get(mod, mod)
+        label = {
+            "yaml": "PyYAML",
+            "tree_sitter": "tree-sitter",
+            "tree_sitter_language_pack": "tree-sitter-language-pack",
+        }.get(mod, mod)
         if present:
             out.append(Check(f"dep: {label}", OK, "importable"))
         elif required:
             out.append(Check(f"dep: {label}", FAIL, "missing", required=True))
+        elif mod == "tree_sitter":
+            out.append(Check(
+                f"dep: {label}",
+                WARN,
+                "NOT INSTALLED — call graph falls back to regex (degraded taint coverage)",
+            ))
+        elif mod == "tree_sitter_language_pack":
+            out.append(Check(
+                f"dep: {label}",
+                WARN,
+                "NOT INSTALLED — tree-sitter AST plugins unavailable; call graph degrades",
+            ))
         else:
             out.append(Check(f"dep: {label}", WARN,
                              "missing (optional — needed only for via:openai)"))
@@ -229,29 +264,30 @@ def detect_ca_cert() -> str | None:
 
 def recommend_profile() -> tuple[str | None, str]:
     """Suggest the shipped profile that matches the credentials actually
-    available. The shipped default profile is CLI-first (every role via: cli),
-    so Claude Code auth is what it needs; sdk.yaml routes every role via: sdk
-    (needs ANTHROPIC_SDK_API_KEY); the OpenAI backend is only exercised by the
-    multi-backend full.yaml.
+    available. This is a starting-profile recommendation, not a claim that
+    every enabled post-scan stage is ready; ``config_check`` reports those
+    provider credentials separately.
     Returns (profile_name, reason)."""
-    # CLI-first: the packaged default runs every role through the `claude`
-    # subprocess, so detect Claude Code auth before any API key.
+    # Prefer the default when Claude Code auth is available because its S1-S9
+    # detection flow uses the CLI. S10/S11 have separate advisory readiness
+    # checks and are skipped when their provider credentials are unavailable.
     cli_auth = shutil.which("claude") and (
         _looks_like_jwt(os.environ.get("ANTHROPIC_API_KEY"))
         or _is_set("ANTHROPIC_AUTH_TOKEN")
         or _is_set("CLAUDE_CODE_OAUTH_TOKEN")
         or _claude_code_login_present())
     if cli_auth:
-        return "default", ("Claude Code auth detected — the default profile runs "
-                           "every role via the claude CLI")
-    # No CLI auth. sdk.yaml is the drop-in all-SDK profile (every role via: sdk),
-    # so recommend it when an SDK key is present; fall back to the multi-backend
-    # full.yaml only for an OpenAI-only credential.
+        return "default", ("Claude Code auth detected — default-profile "
+                           "detection uses the claude CLI; setup checks S10/S11 "
+                           "provider credentials separately")
+    # Without CLI auth, suggest the profile associated with an available API
+    # key. Later checks still report any other credentials that profile needs.
     if _is_set("ANTHROPIC_SDK_API_KEY"):
-        return "sdk", ("ANTHROPIC_SDK_API_KEY is set — sdk.yaml routes every role "
-                       "via: sdk and enables s4 majority voting")
+        return "sdk", ("ANTHROPIC_SDK_API_KEY is set — sdk.yaml routes model "
+                       "roles via sdk; setup checks the S11 credential separately")
     if _is_set("OPENAI_API_KEY"):
-        return "full", "OPENAI_API_KEY is set (multi-backend profile uses OpenAI roles)"
+        return "full", ("OPENAI_API_KEY is set — full.yaml includes OpenAI "
+                        "roles; setup checks its other backends separately")
     return None, "no usable credential detected yet"
 
 
@@ -290,13 +326,27 @@ def config_check(cfg_path: str | Path) -> list[Check]:
         detail = f"{p.name} loads"
     out = [Check("config", OK, detail)]
     roles = ("autoexclude", "preprocess", "threatmodel", "decompose",
-             "deepdive", "verify", "dedup", "chain")
+             "deepdive", "verify", "dedup", "chain", "remediate", "validate")
     vias = set()
     for r in roles:
         node = getattr(getattr(cfg, "models", None), r, None)
         if node is not None:
             vias.add(getattr(node, "via", "cli"))
     out.append(Check("active backends", OK, ", ".join(sorted(vias)) or "(none)"))
+    invalid_deepagents = sorted(
+        r for r in roles
+        if (node := getattr(getattr(cfg, "models", None), r, None)) is not None
+        and getattr(node, "via", "cli") == "deepagents"
+        and r not in DEEPAGENTS_ROLES
+    )
+    if invalid_deepagents:
+        out.append(Check(
+            "via:deepagents roles",
+            FAIL,
+            "supported only for models.remediate and models.validate; invalid "
+            f"role(s): {', '.join(invalid_deepagents)}",
+            required=True,
+        ))
     if "sdk" in vias:
         out.append(_gateway_check())
         sdk_cfg = getattr(cfg, "sdk", None)
@@ -344,7 +394,7 @@ def config_check(cfg_path: str | Path) -> list[Check]:
         out.append(Check("via:cli backend", FAIL,
                          "`claude` CLI not on PATH (required by this profile)",
                          required=True))
-    # Opt-in post-scan steps (s10 remediate / s11 validate). These never block
+    # Profile-controlled post-scan steps (s10 remediate / s11 validate) never block
     # the core scan — when misconfigured the orchestrator disables the step and
     # continues — so their checks are advisory (WARN), but surfacing them here
     # tells an operator who enabled the flags whether the step will actually run.
@@ -353,9 +403,25 @@ def config_check(cfg_path: str | Path) -> list[Check]:
     return out
 
 
-def _backend_credential_ok(via: str) -> tuple[bool, str]:
-    """(ready, detail) for a model role's backend, mirroring the scan-role
-    credential logic above. Presence only — never the value."""
+def remediation_inputs_check() -> Check:
+    """Ensure fail-closed remediation defaults are available."""
+    from vvaharness.remediation_agent import rule_paths
+    missing = rule_paths.missing_rules(rule_paths.__file__)
+    configured = rule_paths.configured_inputs_dir()
+    if not missing:
+        detail = (f"using {configured}" if configured else
+                  "bundled policy and playbook available")
+        return Check("remediation inputs", OK, detail)
+    return Check(
+        "remediation inputs", FAIL,
+        f"missing {', '.join(missing)}; run interactive `vvaharness setup` "
+        "to select the inputs directory", required=True)
+
+
+def _backend_credential_ok(
+    via: str, model_id: str = "", provider: str | None = None
+) -> tuple[bool, str]:
+    """(ready, detail) for a model role's backend. Presence only — never the value."""
     if via == "cli":
         if shutil.which("claude"):
             return True, "`claude` CLI on PATH"
@@ -370,6 +436,16 @@ def _backend_credential_ok(via: str) -> tuple[bool, str]:
         if _is_set("OPENAI_API_KEY"):
             return True, "OPENAI_API_KEY set"
         return False, "OPENAI_API_KEY not set"
+    if via == "deepagents":
+        # Use explicit provider; fall back to name-based inference only when absent.
+        is_openai = (provider == "openai") if provider else ("claude" not in model_id.lower())
+        if is_openai:
+            if _is_set("OPENAI_API_KEY"):
+                return True, "OpenAI-compatible DeepAgents credential present"
+            return False, "OPENAI_API_KEY not set (set OPENAI_BASE_URL for a custom endpoint)"
+        if (_is_set("ANTHROPIC_API_KEY") or _is_set("ANTHROPIC_AUTH_TOKEN")):
+            return True, "Anthropic-compatible DeepAgents credential present"
+        return False, "ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN not set"
     return True, f"via:{via}"
 
 
@@ -385,7 +461,7 @@ def _remediate_checks(cfg) -> list[Check]:
                       "step_remediate.enabled but models.remediate is unset "
                       "— remediation will be skipped")]
     via = getattr(rem, "via", "cli")
-    ready, detail = _backend_credential_ok(via)
+    ready, detail = _backend_credential_ok(via, getattr(rem, "id", ""), getattr(rem, "provider", None))
     return [Check("step10: remediate", OK if ready else WARN,
                   f"via:{via} — {detail}"
                   + ("" if ready else " — remediation will be skipped"))]
@@ -393,28 +469,27 @@ def _remediate_checks(cfg) -> list[Check]:
 
 def _validate_checks(cfg) -> list[Check]:
     """Step-11 readiness — empty unless ``step_validate.enabled``. Mirrors the
-    s11 preflight: ``models.validate`` must be an Anthropic backend (via:openai
-    is rejected), the bundled ``claude_agent_sdk`` must be importable, and the
-    validation path requires Python >= 3.10."""
+    s11 preflight: the legacy via:openai backend is routed to DeepAgents (so the
+    credential reported is the one s11 will actually use), and the bundled
+    ``claude_agent_sdk`` must be importable. The hoisted via:deepagents route is
+    supported."""
     if not getattr(getattr(cfg, "step_validate", None), "enabled", False):
         return []
     out: list[Check] = []
-    val = getattr(getattr(cfg, "models", None), "validate", None)
+    val = _validate_model_spec(cfg)
     if val is None:
         out.append(Check("step11: validate", WARN,
-                         "step_validate.enabled but models.validate is unset "
+                         "step_validate.enabled but models.validate.orchestrator is unset "
                          "— validation will be skipped"))
     else:
-        via = getattr(val, "via", "cli")
-        if via == "openai":
-            out.append(Check("step11: validate", WARN,
-                             "models.validate.via must be 'cli' or 'sdk' "
-                             "(Anthropic) — 'openai' is rejected by s11"))
-        else:
-            ready, detail = _backend_credential_ok(via)
-            out.append(Check("step11: validate", OK if ready else WARN,
-                             f"via:{via} — {detail}"
-                             + ("" if ready else " — validation will be skipped")))
+        from vvaharness.validation.cli._model import _normalize_validate_backend
+        raw_via = getattr(val, "via", "cli")
+        via, provider = _normalize_validate_backend(raw_via, getattr(val, "provider", None))
+        ready, detail = _backend_credential_ok(via, getattr(val, "id", ""), provider)
+        routed = f" (via:{raw_via} routed to {via})" if via != raw_via else ""
+        out.append(Check("step11: validate", OK if ready else WARN,
+                         f"via:{via} — {detail}{routed}"
+                         + ("" if ready else " — validation will be skipped")))
     if importlib.util.find_spec("claude_agent_sdk") is not None:
         out.append(Check("step11: claude_agent_sdk", OK,
                          "claude_agent_sdk importable"))
@@ -472,6 +547,7 @@ def run_checks(cfg_path: str | Path) -> list[Check]:
     checks += credential_checks()
     checks += dep_checks()
     checks.append(tls_check())
+    checks.append(remediation_inputs_check())
     cfg_checks = config_check(cfg_path)
     if cfg_checks:
         checks.append(cfg_checks[0])

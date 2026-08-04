@@ -20,9 +20,9 @@ configured binary is resolved to an absolute path and (b) it reaches the SDK as
 ClaudeAgentOptions.cli_path, so the override is actually effective."""
 from pathlib import Path
 
-from vvaharness.validation.backends.contract.options import (
+from vvaharness.backends.harness.contract.options import (
     OneShotOptions, StreamingOptions)
-from vvaharness.validation.backends.claude.options import (
+from vvaharness.backends.harness.claude.options import (
     build_oneshot_sdk_options, build_streaming_sdk_options)
 from vvaharness.validation.session import launcher
 

@@ -23,4 +23,7 @@ scan run. If a command fails, run `vvaharness setup` / `vvaharness doctor`,
 fix the environment (usually a missing credential or the `ANTHROPIC_BASE_URL`
 gateway), then re-run. Report genuine bugs instead of patching the source.
 
-Run it: `pipx install .` → `vvaharness setup` → `vvaharness scan --repo <path>`.
+Detection-only: `pipx install .` → `vvaharness setup` →
+`vvaharness scan --repo <path> --stop-after s9`.
+
+A plain `scan` may edit target source through default S10 fix-mode remediation.

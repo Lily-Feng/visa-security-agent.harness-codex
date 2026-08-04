@@ -17,15 +17,21 @@ Step 3 — the strategist LLM receives the ContextPackage (no raw code) and prod
 risk-ranked TaskManifest. Single CLI call; repeating this wastes tokens.
 """
 from __future__ import annotations
+import logging
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
+log = logging.getLogger(__name__)
+
 from vvaharness.models import ContextPackage, TaskManifest, Chunk, ChunkSize
 from vvaharness.backends.llm import prompt
 from vvaharness.util.json_extract import extract_json
 from vvaharness.lang.hints import detect_languages, EXT_TO_LANG, is_iac_file
+from vvaharness.pipeline.callgraph_consumer import (seed_reachable_files,
+                                                    seed_paths_by_file,
+                                                    graph_view, qnodes_at)
 from vvaharness.pipeline.stages.s1_preprocess import q_join, q_file, q_name
 
 SYSTEM = """You are a vulnerability research strategist. You receive a structured
@@ -66,18 +72,53 @@ Respond with ONLY a JSON object, no prose:
   ]
 }"""
 
+_TOKEN_RX = re.compile(r"[a-z0-9]+")
+
 
 def run(ctx: ContextPackage, cfg) -> TaskManifest:
-    user_prompt = ctx.to_prompt_block()
-
-    raw = prompt(
-        user_prompt,
-        model=cfg.models.decompose,
-        system_prompt=SYSTEM,
-        max_tokens=getattr(cfg.step3, "max_tokens", None),
-        timeout=getattr(cfg.step3, "timeout", 1800),
-        tag="s3 decompose",
+    log.info("s3/decompose: starting task decomposition - files=%d entry_points=%d sinks=%d modules=%d",
+             len(ctx.all_files), len(ctx.entry_points), len(ctx.unsafe_sinks), len(ctx.modules))
+    prompt_ctx = ctx.ast_context_view(
+        max_files=int(getattr(cfg.step3, "max_prompt_files", 180) or 180),
+        max_entry_points=int(getattr(cfg.step3, "max_prompt_entry_points", 60) or 60),
+        max_sinks=int(getattr(cfg.step3, "max_prompt_sinks", 80) or 80),
+        max_modules=int(getattr(cfg.step3, "max_prompt_modules", 24) or 24),
+        max_edges=int(getattr(cfg.step3, "max_prompt_call_edges", 80) or 80),
+        max_notes_chars=int(getattr(cfg.step3, "max_prompt_notes_chars", 2500) or 2500),
     )
+    user_prompt = prompt_ctx.to_decompose_prompt_block()
+    print(
+        "  [s3] ast frontier: "
+        f"files {len(ctx.all_files)}->{len(prompt_ctx.all_files)}, "
+        f"entry points {len(ctx.entry_points)}->{len(prompt_ctx.entry_points)}, "
+        f"sinks {len(ctx.unsafe_sinks)}->{len(prompt_ctx.unsafe_sinks)}, "
+        f"modules {len(ctx.modules)}->{len(prompt_ctx.modules)}, "
+        f"call edges {sum(len(v) for v in ctx.call_graph.values())}"
+        f"->{sum(len(v) for v in prompt_ctx.call_graph.values())}",
+        file=sys.stderr,
+    )
+    log.debug("s3/decompose: prompt frontier - files=%d->%d eps=%d->%d sinks=%d->%d modules=%d->%d edges=%d->%d",
+              len(ctx.all_files), len(prompt_ctx.all_files),
+              len(ctx.entry_points), len(prompt_ctx.entry_points),
+              len(ctx.unsafe_sinks), len(prompt_ctx.unsafe_sinks),
+              len(ctx.modules), len(prompt_ctx.modules),
+              sum(len(v) for v in ctx.call_graph.values()),
+              sum(len(v) for v in prompt_ctx.call_graph.values()))
+
+    try:
+        raw = prompt(
+            user_prompt,
+            model=cfg.models.decompose,
+            system_prompt=SYSTEM,
+            max_tokens=getattr(cfg.step3, "max_tokens", None),
+            timeout=getattr(cfg.step3, "timeout", 1800),
+            tag="s3 decompose",
+        )
+    except Exception as e:  # provider timeout/network/auth
+        print(f"  [s3] WARN: strategist call failed ({e}); proceeding "
+              "with deterministic coverage only (no LLM ranking).",
+              file=sys.stderr)
+        raw = "{}"
 
     # degrade — don't abort the whole scan — on malformed/empty/wrong-shape
     # strategist output, mirroring how s4/s8 fall back instead of crashing.
@@ -124,14 +165,27 @@ def run(ctx: ContextPackage, cfg) -> TaskManifest:
 
     # ── Specialist passes (repo-wide; lenses defined in _lang_hints.SPECIALIST_HINTS) ──
     n_spec = _add_specialist_chunks(manifest, ctx, cfg)
+    n_fallback = _add_threat_surface_fallback_chunks(manifest, ctx, cfg)
 
     _report_threat_coverage(manifest, ctx)
     _report_chunk_loc(manifest, ctx, cfg)
 
-    print(f"  [s3] done: {len(manifest.chunks)} chunks "
-          f"({n_taint} taint, {n_catchall} catch-all, {n_spec} specialist), "
-          f"top risk = {manifest.sorted_chunks()[0].id if manifest.chunks else 'none'}",
-          file=sys.stderr)
+    tracker = getattr(cfg, "_scan_progress", None)
+    if tracker is not None:
+        for chunk in manifest.chunks:
+            tracker.queued(chunk)
+
+    print(
+        f"  [s3] done: {len(manifest.chunks)} chunks "
+        f"({n_taint} taint, {n_catchall} catch-all, {n_spec} specialist, "
+        f"{n_fallback} threat-fallback), "
+        f"top risk = {manifest.sorted_chunks()[0].id if manifest.chunks else 'none'}",
+        file=sys.stderr,
+    )
+    log.info(
+        "s3/decompose: decomposition complete - chunks=%d (taint=%d catchall=%d specialist=%d threat_fallback=%d)",
+        len(manifest.chunks), n_taint, n_catchall, n_spec, n_fallback,
+    )
     return manifest
 
 
@@ -278,6 +332,197 @@ def _report_threat_coverage(manifest: TaskManifest, ctx: ContextPackage) -> None
           file=sys.stderr)
 
 
+_THREAT_IAC_RX = re.compile(
+    r"\b(supply\s*chain|dependency|dependencies|package|sbom|build|release|"
+    r"ci/?cd|pipeline|workflow|actions?|github\s*actions|jenkins|docker|"
+    r"kubernetes|k8s|terraform|helm|image)\b",
+    re.IGNORECASE,
+)
+_THREAT_LLM_RX = re.compile(
+    r"\b(llm|prompt|jailbreak|rag|tool\s*call|agent|assistant|model\s*output|"
+    r"prompt\s*inject|indirect\s*inject)\b",
+    re.IGNORECASE,
+)
+_THREAT_AUTHZ_RX = re.compile(
+    r"\b(authz|authorization|access\s*control|idor|rbac|acl|privilege|session|"
+    r"csrf|oauth|jwt|tenant\s*isolation)\b",
+    re.IGNORECASE,
+)
+_THREAT_CRYPTO_RX = re.compile(
+    r"\b(crypto|cipher|encryption|decrypt|signature|hmac|hash|md5|sha|tls|ssl|"
+    r"x509|certificate|secret\s*key|key\s*management)\b",
+    re.IGNORECASE,
+)
+_THREAT_DESER_RX = re.compile(
+    r"\b(deserial|pickle|marshal|yaml\.load|objectinputstream|readobject|"
+    r"binaryformatter|xstream|snakeyaml|hessian|kryo)\b",
+    re.IGNORECASE,
+)
+_THREAT_BATCH_RX = re.compile(
+    r"\b(batch|etl|file\s*ingest|bulk\s*import|job\s*scheduler|mainframe|"
+    r"jcl|cobol|record\s*format)\b",
+    re.IGNORECASE,
+)
+_THREAT_CONFIG_RX = re.compile(
+    r"\b(config|configuration|policy|feature\s*flag|runtime\s*toggle|"
+    r"environment\s*variable|env\b|deployment\s*setting)\b",
+    re.IGNORECASE,
+)
+_IAC_PATH_RX = re.compile(
+    r"(\.github/workflows/|dockerfile|jenkinsfile|\.gitlab-ci|azure-pipelines|"
+    r"\.tf$|helm/|k8s/|kubernetes/|chart\.ya?ml$|values\.ya?ml$|"
+    r"pom\.xml$|package\.json$|requirements(\.txt)?$|pyproject\.toml$|"
+    r"poetry\.lock$|setup\.py$)",
+    re.IGNORECASE,
+)
+_LLM_PATH_RX = re.compile(
+    r"(llm|prompt|agent|assistant|openai|anthropic|rag|chat|completion|tool)",
+    re.IGNORECASE,
+)
+_AUTHZ_PATH_RX = re.compile(
+    r"(auth|oauth|jwt|rbac|acl|permission|policy|session|tenant)",
+    re.IGNORECASE,
+)
+_CONFIG_EXTS = {".yml", ".yaml", ".json", ".toml", ".ini", ".conf", ".properties", ".xml", ".env"}
+
+
+def _tok(s: str) -> set[str]:
+    return set(_TOKEN_RX.findall((s or "").lower()))
+
+
+def _is_config_file(rel: str) -> bool:
+    p = PurePosixPath(rel)
+    if p.name.lower().startswith(".env"):
+        return True
+    if p.suffix.lower() in _CONFIG_EXTS:
+        return True
+    name = p.name.lower()
+    return ("config" in name or "policy" in name or "settings" in name)
+
+
+def _threat_text(t) -> str:
+    return " ".join(filter(None, [t.threat, t.surface, t.asset, t.controls, t.actor]))
+
+
+def _matches_threat_surface(ep, t) -> bool:
+    surface_tokens = _tok(t.surface)
+    if not surface_tokens:
+        return False
+    fn = (ep.function or "").lower()
+    if fn and t.surface.lower() == fn:
+        return True
+    return bool(surface_tokens & _tok(ep.function or ""))
+
+
+def _candidate_files_for_threat(t, ctx: ContextPackage,
+                                specialist_files: dict[str, list[str]],
+                                max_files: int) -> list[str]:
+    txt = _threat_text(t)
+    files = [f for f in ctx.all_files if _is_source(f) or _is_config_file(f)]
+    chosen: list[str] = []
+
+    def _add(seq):
+        for f in seq:
+            if f in ctx.all_files and f not in chosen:
+                chosen.append(f)
+                if len(chosen) >= max_files:
+                    return
+
+    if t.actor == "supply_chain" or _THREAT_IAC_RX.search(txt):
+        _add(specialist_files.get("iac", []))
+        _add([f for f in files if is_iac_file(f) or _IAC_PATH_RX.search(f)])
+    if _THREAT_LLM_RX.search(txt):
+        _add([f for f in files if _LLM_PATH_RX.search(f)])
+    if t.actor in {"remote_unauth", "remote_auth"} or _THREAT_AUTHZ_RX.search(txt):
+        _add(specialist_files.get("access-control", []))
+        _add([f for f in files if _AUTHZ_PATH_RX.search(f)])
+    if _THREAT_CRYPTO_RX.search(txt):
+        _add(specialist_files.get("crypto", []))
+    if _THREAT_DESER_RX.search(txt):
+        _add(specialist_files.get("deserialization", []))
+    if _THREAT_BATCH_RX.search(txt):
+        _add(specialist_files.get("batch-etl", []))
+    if _THREAT_CONFIG_RX.search(txt):
+        _add([f for f in files if _is_config_file(f)])
+
+    ep_hits = [ep.file for ep in ctx.entry_points if _matches_threat_surface(ep, t)]
+    _add(ep_hits)
+
+    if chosen:
+        return chosen[:max_files]
+    return []
+
+
+def _add_threat_surface_fallback_chunks(manifest: TaskManifest,
+                                        ctx: ContextPackage,
+                                        cfg) -> int:
+    """Deterministically map uncovered threats to concrete code surface chunks.
+
+    This closes known blind spots where specialist/catch-all chunks provide
+    review coverage but do not increment threat coverage because they carry no
+    ``threat_id``.
+    """
+    step3 = getattr(cfg, "step3", None)
+    if not bool(getattr(step3, "threat_surface_fallbacks", True)):
+        return 0
+    tm = ctx.threat_model
+    if not tm or not tm.threats:
+        return 0
+
+    valid = [t for t in tm.threats if t.id]
+    covered = {c.threat_id for c in manifest.chunks if c.threat_id}
+    missing = [t for t in valid if t.id not in covered]
+    if not missing:
+        return 0
+
+    max_files = int(getattr(step3, "threat_fallback_max_files", 12) or 12)
+    base_rank = max((c.risk_rank for c in manifest.chunks), default=0)
+    repo_root = Path(ctx.repo_root)
+
+    specialist_files: dict[str, list[str]] = defaultdict(list)
+    for c in manifest.chunks:
+        if c.specialist:
+            specialist_files[c.specialist].extend(c.files)
+    for k, v in specialist_files.items():
+        specialist_files[k] = list(dict.fromkeys(v))
+
+    added = 0
+    for t in missing:
+        files = _candidate_files_for_threat(t, ctx, specialist_files, max_files)
+        if not files:
+            continue
+        loc = sum(_count_loc(repo_root / f) for f in files)
+        cid = f"threat-{t.id.lower()}-fallback"
+        used = {c.id for c in manifest.chunks}
+        if cid in used:
+            n = 2
+            while f"{cid}-{n}" in used:
+                n += 1
+            cid = f"{cid}-{n}"
+        focus = [ep.function for ep in ctx.entry_points if _matches_threat_surface(ep, t)][:8]
+        manifest.chunks.append(Chunk(
+            id=cid,
+            size=_size_for(loc),
+            risk_rank=base_rank + added + 1,
+            files=files,
+            focus_entry_points=focus,
+            hypothesis=(
+                f"Deterministic threat-surface fallback for {t.id}: "
+                f"{t.threat}. Review likely files derived from actor/surface "
+                "signals and repository specialist coverage."
+            ),
+            related_cves=[],
+            threat_id=t.id,
+        ))
+        added += 1
+
+    if added:
+        print(f"    [s3] threat-surface fallback: added {added} chunk(s) "
+              f"for previously uncovered threats",
+              file=sys.stderr)
+    return added
+
+
 def _pick_hop_files(candidates, anchors: list[str], cap: int) -> list[str]:
     """Return ≤`cap` candidate files, ranked by longest common directory
     prefix with any anchor (entry/sink file). Java package == dir path, so
@@ -301,6 +546,136 @@ def _pick_hop_files(candidates, anchors: list[str], cap: int) -> list[str]:
 
     cands.sort(key=lambda f: (-_aff(f), f))
     return cands[:cap]
+
+
+def _qnode_for_file_line(ctx: ContextPackage, file_rel: str,
+                         line: int) -> str | None:
+    """Best-effort qnode lookup for a concrete file:line anchor.
+
+    Uses the shared, call-graph-first resolver
+    (:func:`callgraph_consumer.qnodes_at`); ``nearest_if_empty`` gives a
+    single-anchor result when neither a span nor the call graph resolves the
+    file.
+    """
+    if line <= 0:
+        return None
+    hits = qnodes_at(graph_view(ctx), file_rel, line, line,
+                     limit=1, nearest_if_empty=True)
+    return hits[0] if hits else None
+
+
+def _sink_qnodes_for_sink(s, ctx: ContextPackage,
+                          match_qnodes) -> list[str]:
+    """Resolve sink candidates to qnodes using function then line anchors."""
+    out: list[str] = []
+    if s.function:
+        out.extend(match_qnodes(s.file, s.function))
+    if not out and getattr(s, "line", 0):
+        qn = _qnode_for_file_line(ctx, s.file, int(s.line))
+        if qn:
+            out.append(qn)
+    return list(dict.fromkeys(out))
+
+
+def _seed_paths_for_entry(ctx: ContextPackage, ep,
+                          sink_by_qn: dict[str, list],
+                          all_file_set: set[str]) -> list[tuple[str, list[str], str | None, str | None, list[str]]]:
+    """Materialize seed taint paths touching an entry file into taint hits.
+
+    Returns tuples of:
+      (sink_qn, qnode_path, source_ref, sink_ref, sink_cwe)
+    """
+    out: list[tuple[str, list[str], str | None, str | None, list[str]]] = []
+
+    def _ref_file(ref: str) -> str:
+        if not ref:
+            return ""
+        if "::" in ref:
+            return ref.split("::", 1)[0]
+        return ref.split(":", 1)[0]
+
+    def _ref_line(ref: str) -> int:
+        if not ref or "::" in ref:
+            return 0
+        _, _, tail = ref.rpartition(":")
+        return int(tail) if tail.isdigit() else 0
+
+    # Prefer structured taint evidence when available; fall back to legacy
+    # seed_taint_paths when there is no matching evidence for this entry.
+    if ctx.seed_taint_evidence:
+        seen_ev: set[tuple[str, str, tuple[str, ...]]] = set()
+        for evidence in ctx.seed_taint_evidence:
+            # Skip flows that were sanitized before the sink — they
+            # are not exploitable and should not become taint chunks.
+            if evidence.sanitized:
+                continue
+            source_ref = evidence.source_ref or ""
+            sink_ref = evidence.sink_ref or ""
+            source_file = _ref_file(source_ref).replace("\\", "/")
+            sink_file = _ref_file(sink_ref).replace("\\", "/")
+            if source_file != ep.file:
+                continue
+
+            qpath = list(dict.fromkeys(evidence.path_funcs or []))
+            hop_files = [q_file(fn) for fn in qpath if q_file(fn)]
+            hop_files = [f for f in dict.fromkeys(hop_files) if f in all_file_set]
+            if not hop_files:
+                hop_files = [f for f in (source_file, sink_file) if f in all_file_set]
+            if len(hop_files) < 2:
+                continue
+
+            sink_qn = ""
+            sink_line = _ref_line(sink_ref)
+            if sink_file in all_file_set and sink_line > 0:
+                sink_qn = _qnode_for_file_line(ctx, sink_file, sink_line) or ""
+            if not sink_qn and qpath:
+                sink_qn = qpath[-1]
+
+            sink_cwe = sorted(dict.fromkeys(evidence.sink_cwe or []))
+            if not sink_cwe and sink_qn in sink_by_qn:
+                sink_cwe = sorted({c for s in sink_by_qn[sink_qn]
+                                   for c in getattr(s, "cwe", None) or ()})
+
+            ev_key = (source_ref, sink_ref, tuple(qpath))
+            if ev_key in seen_ev:
+                continue
+            seen_ev.add(ev_key)
+            out.append((sink_qn, qpath, source_ref, sink_ref, sink_cwe))
+
+        if out:
+            return out
+
+    by_file = seed_paths_by_file(ctx.seed_taint_paths)
+    for path in by_file.get(ep.file, ()): 
+        if len(path) < 2:
+            continue
+        qpath: list[str] = []
+        hop_files: list[str] = []
+        for hop in path:
+            hf, _, hline = hop.rpartition(":")
+            file_rel = hf if hline else hop
+            file_rel = file_rel.replace("\\", "/")
+            if file_rel not in all_file_set:
+                continue
+            hop_files.append(file_rel)
+            if hline.isdigit():
+                qn = _qnode_for_file_line(ctx, file_rel, int(hline))
+                if qn:
+                    qpath.append(qn)
+        if len(hop_files) < 2:
+            continue
+        sink_ref = path[-1]
+        sf, _, sl = sink_ref.rpartition(":")
+        sink_qn = ""
+        sink_cwe: list[str] = []
+        if sf and sl.isdigit():
+            sink_qn = _qnode_for_file_line(ctx, sf, int(sl)) or ""
+            if sink_qn in sink_by_qn:
+                sink_cwe = sorted({c for s in sink_by_qn[sink_qn]
+                                   for c in getattr(s, "cwe", None) or ()})
+        source_ref = path[0]
+        out.append((sink_qn, qpath, source_ref, sink_ref, sink_cwe))
+    return out
 
 
 def _add_taint_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> int:
@@ -341,9 +716,9 @@ def _add_taint_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> int:
     sink_qnodes: set[str] = set()
     sink_by_qn: dict[str, list] = defaultdict(list)
     for s in ctx.unsafe_sinks:
-        if not s.function:
+        if not s.function and not getattr(s, "line", 0):
             continue
-        for qn in _match_qnodes(s.file, s.function):
+        for qn in _sink_qnodes_for_sink(s, ctx, _match_qnodes):
             sink_qnodes.add(qn)
             sink_by_qn[qn].append(s)
 
@@ -358,9 +733,6 @@ def _add_taint_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> int:
         c.risk_rank += max_chunks
 
     threats = ctx.threat_model.threats if ctx.threat_model else []
-
-    def _tok(s: str) -> set[str]:
-        return set(re.findall(r"[a-z0-9]+", s.lower()))
 
     # Per-threat surface tokens are loop-invariant across entry points, so
     # tokenize each threat surface once here rather than on every _threat_for
@@ -396,6 +768,52 @@ def _add_taint_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> int:
         if added >= max_chunks:
             break
         hits: list[tuple[str, list[str]]] = []
+
+        # Prefer concrete S0-proven taint paths when available.
+        for sink_qn, qpath, src_ref, snk_ref, cwes in _seed_paths_for_entry(
+                ctx, ep, sink_by_qn, all_file_set):
+            if added >= max_chunks:
+                break
+            hop_files = [q_file(fn) for fn in qpath if q_file(fn)]
+            if not hop_files:
+                # Keep at least source/sink files from seed hops.
+                sf, _, _ = (src_ref or "").rpartition(":")
+                tf, _, _ = (snk_ref or "").rpartition(":")
+                hop_files = [x for x in (sf, tf) if x]
+            files = _pick_hop_files(hop_files, [ep.file],
+                                    per_hop * max(1, len(qpath) or 2))
+            files.append(ep.file)
+            if snk_ref:
+                tf, _, _ = snk_ref.rpartition(":")
+                if tf:
+                    files.append(tf)
+            files = [f for f in dict.fromkeys(files) if f in all_file_set]
+            if not files:
+                continue
+            sig = (ep.function, sink_qn or snk_ref or "seed", tuple(sorted(files)))
+            if sig in seen_paths:
+                continue
+            seen_paths.add(sig)
+            added += 1
+            manifest.chunks.append(Chunk(
+                id=f"taint-{added:02d}",
+                size=_size_for(sum(_count_loc(repo_root / f) for f in files)),
+                risk_rank=added,
+                files=files,
+                focus_entry_points=[ep.function],
+                hypothesis=(
+                    f"Seed path evidence: {ep.kind} input at {ep.function}() "
+                    f"[{ep.file}] reaches sink [{snk_ref or sink_qn or 'unknown'}]. "
+                    "Validate each hop for missing sanitization and real exploitability."
+                ),
+                related_cves=[],
+                threat_id=_threat_for(ep),
+                path_funcs=qpath,
+                source_ref=src_ref or q_join(ep.file, ep.function),
+                sink_ref=snk_ref or (q_file(sink_qn) if sink_qn else ""),
+                sink_cwe=cwes,
+            ))
+
         for start in _match_qnodes(ep.file, ep.function):
             hits.extend(_bfs_to_sinks(start, graph, sink_qnodes, max_hops))
         reached_fns.update(qn for qn, _ in hits)
@@ -426,6 +844,7 @@ def _add_taint_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> int:
             sink_refs = ", ".join(f"{s.file}:{s.line}"
                                   for s in sinks_here[:3]) or q_file(sink_qn)
             unauth = "UNAUTH " if ep.reachable_from_unauth else ""
+            sink_first = sinks_here[0] if sinks_here else None
             manifest.chunks.append(Chunk(
                 id=f"taint-{added:02d}",
                 size=_size_for(sum(_count_loc(repo_root / f) for f in files)),
@@ -441,6 +860,16 @@ def _add_taint_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> int:
                 ),
                 related_cves=[],
                 threat_id=_threat_for(ep),
+                # structured taint metadata → s4 function-slice + confirm/refute
+                path_funcs=list(path),
+                source_ref=q_join(ep.file, ep.function),
+                sink_ref=(f"{sink_first.file}:{sink_first.line}"
+                          if sink_first else q_file(sink_qn)),
+                # Union of CWE tags from every seed-sink at this qnode. Drives
+                # CweKB.prompt_block() in s4 — empty when the sink was
+                # agent-discovered (KB block then omits itself → legacy prompt).
+                sink_cwe=sorted({c for s in sinks_here
+                                 for c in getattr(s, "cwe", None) or ()}),
             ))
 
     reached_sink_objs = {id(s) for qn in reached_fns
@@ -471,24 +900,43 @@ def _add_taint_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> int:
 
 def _bfs_to_sinks(start: str, graph: dict[str, list[str]],
                   sinks: set[str], max_hops: int) -> list[tuple[str, list[str]]]:
-    """Return [(sink_fn, path_funcs)] for every sink reachable from `start`."""
+    """Return [(sink_fn, path_funcs)] for every sink reachable from `start`
+    via a path that does NOT pass through a known sanitizer.
+
+    Paths that cross a sanitizer are silently dropped: they still generate
+    reachability noise but carry no proven taint, so skipping them reduces
+    false-positive chunk generation.  S4 (LLM confirm/refute) handles the
+    residual uncertain cases.
+    """
     if not start:
         return []
+    # Minimal set of sanitizer bare-names — mirrors _SANITIZER_NAMES from the
+    # callgraph engine without importing across package boundaries.
+    _SANITIZER_BARE: frozenset[str] = frozenset({
+        "escape", "quote", "sanitize", "clean", "encode", "validate",
+        "strip_tags", "html_escape", "xml_escape", "quote_plus", "urlencode",
+        "bleach_clean", "prepared_statement", "parameterized",
+        "to_int", "int", "float", "bool",
+    })
     out: list[tuple[str, list[str]]] = []
     visited = {start}
-    frontier = [(start, [start])]
+    # frontier entries: (node, path, sanitized_on_path)
+    frontier: list[tuple[str, list[str], bool]] = [(start, [start], False)]
     while frontier:
         nxt = []
-        for node, path in frontier:
+        for node, path, is_sanitized in frontier:
             for callee in graph.get(node, ()):
                 if callee in visited:
                     continue
                 visited.add(callee)
+                callee_bare = callee.rpartition("::")[2].lower()
+                hit = is_sanitized or callee_bare in _SANITIZER_BARE
                 p = path + [callee]
                 if callee in sinks:
-                    out.append((callee, p))
+                    if not hit:
+                        out.append((callee, p))
                 if len(p) <= max_hops:
-                    nxt.append((callee, p))
+                    nxt.append((callee, p, hit))
         frontier = nxt
     return out
 
@@ -635,6 +1083,131 @@ def _catchall_eligible(rel: str) -> bool:
     return True
 
 
+def _lang_of_file(f: str) -> str | None:
+    """Language for a repo-relative path via extension, or None if unknown."""
+    return EXT_TO_LANG.get(PurePosixPath(f).suffix.lower())
+
+
+def _reachable_files(ctx: ContextPackage) -> set[str]:
+    """
+    File-level reachability set for ``step3.catchall_mode: reachable_only``.
+
+    A file is *reachable* iff it lies on the forward closure from any
+    ``EntryPoint.file`` OR the backward closure to any ``Sink.file`` over a
+    file-level projection of ``ctx.call_graph`` (whose nodes are already
+    file-qualified ``path::name``). This is intentionally coarser than the
+    function-level taint walk — for catch-all gating we only need to decide
+    *which files* might sit on an attacker-controlled data path, not which
+    functions. Full BFS (no hop cap): the file graph has ≤ len(all_files)
+    nodes, so it's cheap.
+
+    Conservative biases (all widen the set, never shrink it):
+      • every EntryPoint.file and Sink.file is always reachable, even if the
+        call graph never mentions it;
+      • polymorphic defs: any file listed in ``ctx.call_graph_files[name]``
+        for a reachable function name is pulled in too, so an interface call
+        keeps every implementation file in scope.
+    """
+    fwd: dict[str, set[str]] = defaultdict(set)
+    rev: dict[str, set[str]] = defaultdict(set)
+    for caller, callees in (ctx.call_graph or {}).items():
+        cf = q_file(caller)
+        for callee in callees or ():
+            tf = q_file(callee)
+            if cf and tf and cf != tf:
+                fwd[cf].add(tf)
+                rev[tf].add(cf)
+
+    # Polymorphic widening: bare-name → all def-site files. If file F calls
+    # bare name N, treat F → every file that defines N.
+    name_to_files: dict[str, set[str]] = defaultdict(set)
+    for name, sites in (ctx.call_graph_files or {}).items():
+        bare = q_name(name)
+        for ref in sites or ():
+            f = ref.split(":", 1)[0]
+            if f:
+                name_to_files[bare].add(f)
+    for caller, callees in (ctx.call_graph or {}).items():
+        cf = q_file(caller)
+        if not cf:
+            continue
+        for callee in callees or ():
+            for tf in name_to_files.get(q_name(callee), ()):
+                if tf != cf:
+                    fwd[cf].add(tf)
+                    rev[tf].add(cf)
+
+    def _bfs(seeds: set[str], graph: dict[str, set[str]]) -> set[str]:
+        seen = set(seeds)
+        frontier = list(seeds)
+        while frontier:
+            nxt: list[str] = []
+            for n in frontier:
+                for m in graph.get(n, ()):
+                    if m not in seen:
+                        seen.add(m)
+                        nxt.append(m)
+            frontier = nxt
+        return seen
+
+    ep_files = {e.file for e in ctx.entry_points if e.file}
+    sk_files = {s.file for s in ctx.unsafe_sinks if s.file}
+    # s0 codeFlow evidence: any file semgrep placed on a source→sink path is
+    # reachable by construction, regardless of whether the call-graph (which
+    # is blind to reflection/DI/dynamic dispatch) has an edge for it. This is
+    # widen-only — it can never shrink the set.
+    seed_files = seed_reachable_files(ctx.seed_taint_paths)
+
+    # Fail-safe for language coverage: the call graph is built only for the
+    # languages the s0 engine has plugins for (6 of ~42). Files in a language
+    # that contributed *zero* graph nodes are structurally absent from the
+    # closures above and would be labelled unreachable purely for lack of a
+    # parser — an unknown, not a proven-unreachable, state. Treat such files as
+    # reachable so reachable_only never drops a whole language. This is
+    # widen-only; a language that DID contribute nodes is still pruned normally.
+    graph_node_files: set[str] = set(ep_files) | set(sk_files) | set(seed_files)
+    for caller, callees in (ctx.call_graph or {}).items():
+        if (cf := q_file(caller)):
+            graph_node_files.add(cf)
+        for callee in callees or ():
+            if (tf := q_file(callee)):
+                graph_node_files.add(tf)
+    for sites in (ctx.call_graph_files or {}).values():
+        for ref in sites or ():
+            if (f := ref.split(":", 1)[0]):
+                graph_node_files.add(f)
+    covered_langs = {lang for f in graph_node_files
+                     if (lang := _lang_of_file(f))}
+    unknown_lang_files = {
+        f for f in ctx.all_files
+        if (lang := _lang_of_file(f)) is not None and lang not in covered_langs
+    }
+
+    return (_bfs(ep_files, fwd) | _bfs(sk_files, rev)
+            | ep_files | sk_files | seed_files | unknown_lang_files)
+
+
+def _reachable_only_too_sparse(reachable_count: int, total_count: int, cfg) -> tuple[bool, str]:
+    """Return True when reachable-only coverage is too sparse to trust.
+
+    Taint profiles use reachable-only to save tokens, but an under-built graph
+    should fail open rather than exclude most catch-all review. Both thresholds
+    default to disabled for backwards compatibility; taint profiles opt in.
+    """
+    if total_count <= 0:
+        return False, ""
+    step3 = getattr(cfg, "step3", None)
+    min_ratio = float(getattr(step3, "catchall_reachable_min_ratio", 0.0) or 0.0)
+    min_files = int(getattr(step3, "catchall_reachable_min_files", 0) or 0)
+    ratio = reachable_count / total_count
+    reasons: list[str] = []
+    if min_ratio > 0 and ratio < min_ratio:
+        reasons.append(f"reachable ratio {ratio:.0%} < {min_ratio:.0%}")
+    if min_files > 0 and reachable_count < min_files:
+        reasons.append(f"reachable files {reachable_count} < {min_files}")
+    return bool(reasons), "; ".join(reasons)
+
+
 def _add_catchall_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> int:
     """Create low-rank chunks for every file not already assigned to a chunk."""
     covered: set[str] = set()
@@ -647,6 +1220,46 @@ def _add_catchall_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> in
               file=sys.stderr)
         return 0
     eligible = [f for f in uncovered if _catchall_eligible(f)]
+
+    # ── reachable-only gate (taint.yaml) ────────────────────────────────
+    # Drop any catch-all candidate that is NOT forward-reachable from an
+    # entry point NOR backward-reachable from a sink on the file-level call
+    # graph. Dropped files are recorded on the manifest for the report
+    # appendix — coverage is auditable, not silently truncated. Falls back
+    # to legacy `all` when there are no entry points/sinks (gating would
+    # otherwise drop the whole repo).
+    mode = str(getattr(cfg.step3, "catchall_mode", "all")).lower()
+    if mode == "reachable_only" and eligible:
+        if not (ctx.entry_points or ctx.unsafe_sinks):
+            print("    [s3] catchall_mode=reachable_only but s0/s1 produced "
+                  "0 entry points and 0 sinks — falling back to mode=all",
+                  file=sys.stderr)
+        else:
+            reach = _reachable_files(ctx) & set(ctx.all_files)
+            before = len(eligible)
+            dropped = sorted(f for f in eligible if f not in reach)
+            kept = [f for f in eligible if f in reach]
+            too_sparse, sparse_reason = _reachable_only_too_sparse(
+                len(kept), before, cfg)
+            if too_sparse:
+                manifest.unreachable_files = []
+                print(f"    [s3] catchall_mode=reachable_only: "
+                      f"{before} eligible → {len(kept)} reachable; "
+                      f"falling back to mode=all ({sparse_reason})",
+                      file=sys.stderr)
+            else:
+                eligible = kept
+                manifest.unreachable_files = dropped
+                pct = (100 * len(dropped) / before) if before else 0
+                sample = ", ".join(dropped[:5])
+                if len(dropped) > 5:
+                    sample += f", …(+{len(dropped) - 5})"
+                print(f"    [s3] catchall_mode=reachable_only: "
+                      f"{before} eligible → {len(eligible)} reachable "
+                      f"({len(dropped)} dropped, {pct:.0f}% — listed in report "
+                      f"appendix){'; e.g. ' + sample if dropped else ''}",
+                      file=sys.stderr)
+
     if not eligible:
         if uncovered:
             print(f"    [s3] coverage: {len(uncovered)} uncovered files "
@@ -689,7 +1302,8 @@ def _add_specialist_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> 
     if not enabled:
         print("    [s3] specialists: all gated off (no matching surface)", file=sys.stderr)
         return 0
-    if not enabled or not source:
+    if not source:
+        print("    [s3] specialists: 0 source files after filtering", file=sys.stderr)
         return 0
 
     repo_root = Path(ctx.repo_root)
@@ -721,9 +1335,10 @@ def _add_specialist_chunks(manifest: TaskManifest, ctx: ContextPackage, cfg) -> 
         else:
             spec_buckets = default_buckets
         for shard, (label, files, loc) in enumerate(spec_buckets, 1):
+            focus = _specialist_focus_entry_points(files, ctx)
             manifest.chunks.append(_mk_specialist(
                 spec, shard, label, files, loc, base_rank + n_added + 1,
-                detect_languages(files, repo_root=repo_root)))
+                detect_languages(files, repo_root=repo_root), focus))
             n_added += 1
 
     print(f"    [s3] specialists: {', '.join(enabled)} -> {n_added} chunks "
@@ -815,18 +1430,38 @@ def _gate_specialists(enabled: list[str], ctx: ContextPackage,
 
 
 def _mk_specialist(spec: str, shard: int, label: str, files: list[str], loc: int,
-                   rank: int, langs: list[str]) -> Chunk:
+                   rank: int, langs: list[str],
+                   focus: list[str]) -> Chunk:
     return Chunk(
         id=f"spec-{spec}-{shard:02d}",
         size=_size_for(loc),
         risk_rank=rank,
         files=files,
-        focus_entry_points=[],
+        focus_entry_points=focus,
         hypothesis=f"{spec} specialist sweep over module '{label}'.",
         related_cves=[],
         languages=langs,
         specialist=spec,
     )
+
+
+def _specialist_focus_entry_points(files: list[str], ctx: ContextPackage,
+                                   cap: int = 24) -> list[str]:
+    """Best-effort method anchors for specialist shards.
+
+    Uses call_graph_files def-sites to pick function names that are actually
+    present in the shard's file set; S4 uses these names to prioritize spans.
+    """
+    if not files:
+        return []
+    file_set = set(files)
+    out: list[str] = []
+    for fn, locs in (ctx.call_graph_files or {}).items():
+        if any((ref.rpartition(":")[0] in file_set) for ref in (locs or ())):
+            out.append(fn)
+            if len(out) >= cap:
+                break
+    return out
 
 
 def _mk_catchall(idx: int, dir_name: str, files: list[str], loc: int, rank: int) -> Chunk:

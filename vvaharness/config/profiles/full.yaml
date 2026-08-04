@@ -16,8 +16,9 @@
 #
 # Each model role chooses its own backend:
 #   via: cli    → `claude` CLI subprocess (auth: run `claude` then `/login`).
-#                 Provides Read/Glob/Grep/Bash natively. The only backend
-#                 with Bash — use it if a role needs to shell out.
+#                 Can provide Read/Glob/Grep/Bash natively, but grants only
+#                 tools named in that step's `allowed_tools`. It is the only
+#                 detection backend capable of Bash.
 #   via: sdk    → Anthropic Python SDK (auth: ANTHROPIC_SDK_API_KEY).
 #                 Temperature control + connection pooling. Agentic roles
 #                 (preprocess, verify) use a local sandboxed Read/Glob/Grep
@@ -29,38 +30,45 @@
 # defaults to `via: cli` for backward compatibility.
 
 models:
+  # ── Credential and static-analysis summary ────────────────────────────
+  # This mixed profile needs Claude Code auth for CLI roles,
+  # ANTHROPIC_SDK_API_KEY for direct-SDK roles and S10, and OPENAI_API_KEY for
+  # OpenAI roles. S11 via:sdk pins external `claude`; it does not translate the
+  # SDK-named key and instead uses Claude login/OAuth or a standard Anthropic
+  # API key/auth token.
+  # Step 0 and step1.call_graph are omitted: S0 is disabled and S1 inherits
+  # the regex graph. Use default.yaml or taint.yaml for shipped tree-sitter S0/S1.
   # --auto-step1: repo survey is pre-packed in Python → single CLI prompt
   autoexclude: {id: claude-opus-4-8,       via: cli}
 
-  # Step 1: Prefer to use cli approch for step1 if your model supports it.
-  # agentic repo exploration — needs filesystem tools. via:sdk and via:openai use the sandboxed Read/Glob/Grep loop in
-  # vvaharness/backends/localtools.py (no Bash — keep it out of step1.allowed_tools below).
-  # Swap to via: cli to restore the CLI path (which also grants Bash).
-  # since it can use Bash for more efficient repo inventory and flexible evidence retrieval. 
-  # The SDK/OpenAI approach is more limited (Read/Glob/Grep only) but still effective, 
-  # and is the only option for models that reject `temperature` (Opus 4.7+).
+  # Step 1: agentic repo exploration needs filesystem tools. via:sdk and
+  # via:openai use the sandboxed Read/Glob/Grep loop in
+  # vvaharness/backends/localtools.py. via:cli uses the CLI-native tool surface,
+  # but Bash is available only when it is explicitly added to
+  # step1.allowed_tools. Temperature support is irrelevant to this stage.
 
   preprocess:  {id: claude-opus-4-8, via: sdk}
 
-  # Step 2: threat model — single-shot SDK reasoning over packed evidence
+  # Step 2: threat model — one direct OpenAI request over packed evidence.
   threatmodel: {id: gpt-5.5, via: openai}
 
-  # Step 3: strategic decomposition — pure reasoning over the ContextPackage,
-  # no tools needed → SDK for direct max_tokens / connection pooling.
+  # Step 3: strategic decomposition — a direct OpenAI request over the packed
+  # ContextPackage; no filesystem tools are needed.
   decompose:   {id: gpt-5.5, via: openai}
 
-  # Step 4: deep-dive — Sonnet 4.6 via sdk @ T0.4 enables s4 majority voting
-  # (step4.runs / vote_threshold below). For single-pass, point deepdive at a
-  # via:cli or temperature-rejecting model.
-  # Swap the line below to switch backend — all three are interchangeable here:
+  # Step 4: deep-dive — Sonnet 4.6 via sdk @ T0.4 enables repeated-run majority
+  # voting (step4.runs / vote_threshold below). Set step4.runs: 1 for an explicit
+  # single pass. With runs > 1, CLI routes and known temperature-rejecting SDK
+  # models auto-collapse to one run; OpenAI routes retain the configured runs.
+  # All three backend selectors are supported here, with those voting differences:
   #   {id: claude-opus-4-7, via: cli}     ← Claude CLI subprocess
   #   {id: claude-opus-4-7,       via: sdk,}     ← Anthropic SDK
   #   {id: gpt-4o, via: openai}  ← OpenAI SDK
 
   deepdive:    {id: claude-sonnet-4-6, via: sdk, temperature: 0.4}  # Step-4 deep dive (risk/catchall/specialist chunk analysis); T>0 enables step4 majority voting (runs/vote_threshold)
 
-  # Step 6: adversarial verification — needs Read/Glob/Grep.
-  # cli and openai both provide them; swap freely:
+  # Step 6: adversarial verification needs Read/Glob/Grep; cli, sdk, and openai
+  # routes all provide those tools.
   verify:      {id: gpt-5.5, via: openai}
 
   # Step 7: semantic deduplication
@@ -69,18 +77,19 @@ models:
   # Step 8: chain analysis
   chain:       {id: claude-opus-4-8,  via: cli}
 
-  # Step 10: remediation — the Remediation Agent proposes a minimal fix for
-  # each verified finding and writes per-finding artefacts under
-  # <repo>/security-remediation/.
+  # Step 10: enabled both in `scan` and through standalone `remediate`. It
+  # selects up to step_remediate.top_n_findings, can edit target source in fix
+  # mode, and writes artefacts under <repo>/security-remediation/.
   remediate:   {id: claude-opus-4-8, via: sdk}
 
-  # models.validate: used by `vvaharness validate` / `s11` (standalone validator).
-  # MUST be an Anthropic model: the validate agent requires via:sdk or via:cli.
-  validate:    {id: claude-sonnet-4-6, via: sdk}
-  # Per-persona model overrides for the s11 validator (unset a line to inherit models.validate):
-  validate_security_architect: {id: claude-opus-4-8}
-  validate_penetration_tester: {id: claude-sonnet-4-6}
-  validate_cross_repo_analyzer: {id: claude-sonnet-4-6}
+  # models.validate: used by enabled in-scan S11 and standalone `validate`.
+  # This via:sdk S11 route pins external `claude` and uses Claude login/OAuth or
+  # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, not ANTHROPIC_SDK_API_KEY.
+  validate:
+    orchestrator:       {id: claude-sonnet-4-6, via: sdk}
+    security_architect: {id: claude-opus-4-8}
+    penetration_tester: {id: claude-sonnet-4-6}
+    cross_repo_analyzer: {id: claude-sonnet-4-6}
 
 
 sdk:
@@ -88,26 +97,25 @@ sdk:
   api_key: ${ANTHROPIC_SDK_API_KEY}
   base_url:   ${ANTHROPIC_SDK_BASE_URL}
   verify_ssl: true
-  ca_cert:     ${ANTHROPIC_SDK_CA_CERT}     # CA bundle for the gateway (env-overridable)
-  client_cert: ${ANTHROPIC_SDK_CLIENT_CERT}              # client cert for mTLS; empty = off
+  ca_cert:     ${ANTHROPIC_SDK_CA_CERT}     # absolute CA path; direct SDK detection only
+  client_cert: ${ANTHROPIC_SDK_CLIENT_CERT} # absolute mTLS cert path; direct SDK detection only
 
 openai:
   # Required for via:openai roles. Set in .env — NEVER hardcode here.
   api_key:    ${OPENAI_API_KEY}
   base_url:   ${OPENAI_BASE_URL}
   verify_ssl: true
-  ca_cert:    ${OPENAI_CA_CERT}        # CA bundle for the OpenAI endpoint (env-overridable)
+  ca_cert:    ${OPENAI_CA_CERT}        # absolute CA path; direct via:openai only
   # organization: org-xxxx
 
 cli:
-  # TLS/proxy for the `claude` CLI subprocess (via:cli roles). The CLI hits the
-  # same Anthropic gateway as via:sdk — point this at the same private root CA
-  # only if your gateway uses one. All keys are OPTIONAL: unset env vars expand
-  # to empty and inject nothing, so the subprocess inherits the ambient env
-  # exactly as before. Auth/endpoint stay delegated to the CLI's own precedence.
+  # TLS for direct via:cli roles (autoexclude and chain here). S11 via:sdk also
+  # pins external `claude`, but uses process trust rather than cli.ca_cert.
+  # Unset values inject nothing; direct CLI auth/endpoint remain delegated to
+  # Claude login, CLAUDE_CODE_OAUTH_TOKEN, and ANTHROPIC_BASE_URL.
   verify_ssl: true
-  ca_cert:    ${CLAUDE_CLI_CA_CERT}    # CA bundle -> NODE_EXTRA_CA_CERTS; empty = off
-  # client_cert: NOT supported on the CLI backend (Node has no env path); use via:sdk for mTLS.
+  ca_cert:    ${CLAUDE_CLI_CA_CERT}    # absolute CA path -> NODE_EXTRA_CA_CERTS; empty = off
+  # client_cert: unavailable here; only direct SDK detection exposes configured mTLS.
   # Reasoning effort pinned for the `claude -p` subprocess so the scan never
   # inherits the operator's interactive /effort default (e.g. 'xhigh', which
   # some models reject). Opus-tier models support high|low|max|medium.
@@ -123,10 +131,10 @@ step1:
   auto_exclude_max_tokens: 8000     # output cap for the auto-exclude survey call (models.autoexclude)
 
   # ── Agentic-phase quality vs cost ──
-  max_budget_usd: 25.0              # agentic exploration budget cap (via:cli only; sdk/openai ignore it)
+  max_budget_usd: 25.0              # retained for parity; this profile's raw SDK S1 does not enforce it
 
-  max_turns: 40                     # tool-loop cap — enforced on via:sdk and via:openai.
-                                    # via:cli manages its own loop and ignores this.
+  max_turns: 40                     # tool-loop cap for via:sdk/via:openai; forwarded
+                                    # when an installed via:cli build supports it.
                                     # Raise it for large repos where exploration force-finalises at the cap.
 
   allowed_tools:                    # tools the explorer may use. Read/Glob/Grep
@@ -217,7 +225,7 @@ step2:                              # threat-model (assets, trust boundaries, ra
 
 step3:
   max_tokens: 64000
-  timeout: 3600                     # seconds; cli.prompt subprocess deadline (decompose can exceed 10m on large repos)
+  timeout: 3600                     # seconds; forwarded as the direct OpenAI request timeout
   taint_chunks: true                # emit entry→sink data-flow chunks (taint-NN) ranked above LLM risk chunks
   taint_max_hops: 10                 # max call-graph depth when walking entry→sink
   taint_max_chunks: 60              # cap on emitted taint chunks
@@ -240,11 +248,13 @@ step3:
     - batch-etl
     - iac                           # Terraform/Dockerfile/k8s/Helm/GH-Actions/Ansible — gated off if no IaC files present
   specialist_chunk_loc: 10000       # shard specialist scope by this many LOC
+  threat_surface_fallbacks: true    # add deterministic threat-tagged fallback chunks when threats remain uncovered
+  threat_fallback_max_files: 12     # per-threat file cap for fallback chunk candidate selection
 
 step4:
   parallel: 5                       # concurrent chunks processed at once (1 = sequential)
-  timeout: 1800                     # seconds; per-chunk deadline. via:cli (claude subprocess) hard-kills at this; via:sdk uses streaming so it rarely matters. 
-  runs: 3                           # same chunk run N× at T>0; auto-forced to 1 if deepdive.via != sdk OR if the model rejects `temperature`.
+  timeout: 1800                     # seconds; forwarded as the Anthropic SDK stream-request timeout
+  runs: 3                           # repeat each chunk N×; CLI and SDK models known to reject `temperature` auto-collapse to 1. OpenAI retains N runs.
   vote_threshold: 2                 # finding must appear in ≥N runs to survive → drops T>0 hallucinations
   specialist_runs: 1                # specialist chunks run once (s6 verifies them)
   line_bucket: 10                   # canonical key buckets lines to +/- this many
@@ -257,7 +267,7 @@ step5_prefilter:                    # deterministic gates applied BEFORE s6 veri
   # These gates complement s4 majority voting (enabled in this profile): they
   # drop hallucinated / unproven findings before paying the per-finding s6
   # verifier budget. (They are the *primary* FP defence in profiles where voting
-  # is off — the all-cli default.yaml, or any temperature-rejecting deepdive.)
+  # is off — the all-cli default.yaml, or a known temperature-rejecting SDK model.)
   min_pre_confidence: 0.6           # drop s4 findings with self-rated confidence below this
   require_evidence: true            # drop findings missing source_ref or sink_ref (data flow unproven)
   # Legacy: these two knobs used to live under `step6_verify`. s5 still reads
@@ -266,8 +276,8 @@ step5_prefilter:                    # deterministic gates applied BEFORE s6 veri
 step6_verify:                       # adversarial verification (one verifier per finding)
   parallel: 5                       # concurrent verifier subprocesses (429 backoff is automatic)
   min_confidence: 7                 # TRUE_POSITIVE below this → dropped as UNCONFIRMED
-  max_budget_usd: 10.0              # per-finding agentic budget cap
-  max_turns: 30                     # THIS to cap via:sdk / via:openai verifier loop
+  max_budget_usd: 10.0              # retained for parity; direct OpenAI verifier does not enforce it
+  max_turns: 30                     # verifier tool-loop cap
   allowed_tools:
     - Read
     - Glob
@@ -285,12 +295,13 @@ step8:
 step_remediate:                     # Remediation Agent — ON by default. Set `enabled: false` to opt out (`--remediate` forces on).
   enabled: true
   enforce_policy: false             # opt-in: deny-list/playbook gate + diff post-gate (revert forbidden-path edits)
-  # policy_file:  null              # override path to remediation_policy.yaml (default: shipped repo-root inputs/)
-  # playbook_file: null             # override path to remediation_playbook.yaml (default: shipped repo-root inputs/)
+  # Optional rule overrides; null uses the files bundled with the installation.
+  #policy_file: null
+  #playbook_file: null
 
   top_n_findings: 20                # top-N by CVSS — bounds cost on large reports (source of truth; --top N overrides ad-hoc; set 'all'/'*'/null to remediate EVERY finding)
-  max_budget_usd: 10.0              # per-repo soft cap (token accounting via TOKENS.phase)
-  max_turns: 40                     # tool-loop cap (via:sdk / via:openai)
+  max_budget_usd: 10.0              # per-finding Claude Agent SDK spend cap
+  max_turns: 40                     # per-finding Claude Agent SDK turn cap
   allowed_tools:                    # fix mode needs file-write — Edit/Write are
                                     # used instead of Bash so the agent can apply
                                     # diffs without a host shell. cwd-confined.
@@ -302,26 +313,29 @@ step_remediate:                     # Remediation Agent — ON by default. Set `
 
 step_validate:                      # s11 validator — ON by default (mirrors step_remediate). Set `enabled: false` to opt out.
   enabled: true
-  effort: high
-  max_turns: 50
-  max_budget_usd: 15.0
+  effort: high                      # Claude Agent SDK reasoning effort
+  max_turns: 50                     # validation-panel turn cap
+  max_budget_usd: 15.0              # validation-panel spend cap
   max_findings: 20                  # top-N validatable (awaiting_validation / needs_review / validation_failed) by CVSS; --all bypasses, --finding ignores
-  allowed_tools:                    # reviewer-persona tools for inspecting remediated code (read-only). Bash is not available in validation sessions; Write/Edit/Agent always denied.
+  allowed_tools:                    # reviewer-persona tools for inspecting remediated code (read-only).
+                                    # The parent may use Agent to launch personas; persona
+                                    # tools are only the readers below. Write/Edit/Bash are denied.
     - Read
     - Grep
     - Glob
 
 inject:
+  # Optional external context. Relative paths resolve against this profile's
+  # directory, not the target repo; use absolute paths in a copied profile.
+  # Missing files safely mean no injected CVEs, controls, or CMDB context.
   cve_file:       ./inputs/known_cves.json
   controls_file:  ./inputs/design_controls.yaml
   # Single CMDB export. Optional: if unset or the file is absent, VulContextSeverity environmental scoring is skipped
   # (CVSS base + OffensivePriority are still computed). No legacy fallback.
   
   cmdb_file:      ./inputs/cmdb.csv
-  policy_file:    ./inputs/remediation_policy.yaml              # override path to remediation_policy.yaml (default: shipped repo-root inputs/)
-  playbook_file:  ./inputs/remediation_playbook.yaml             # override path to remediation_playbook.yaml (default: shipped repo-root inputs/)
-
-
+  policy_file:    ./inputs/remediation_policy.yaml
+  playbook_file:  ./inputs/remediation_playbook.yaml
 batch:
   # PAT for cloning private repos over HTTPS in --repo-file mode.
   # Injected as https://x-access-token:<PAT>@host/org/repo.git
@@ -343,6 +357,18 @@ batch:
     - "*test-buddy*"
     - "*-e2e*"
     - "*-mock-*"
+
+scan_progress:
+  # ── Real-time file/chunk-level progress tracking ────────────────────────
+  # Emits S0-S9 stage lifecycle lines plus detailed S1 discovery, S2 notes,
+  # S3 queueing, and S4 chunk/result/summary lines to stderr. Report output is
+  # unaffected.
+  #
+  # Environment variable override: VVAHARNESS_SCAN_PROGRESS_ENABLED=1
+  enabled: false
+  # compact: lifecycle lines plus notable file lists; verbose: every file;
+  # summary_only: only the final S4 summary block (which may span several lines).
+  style: compact    # compact | verbose | summary_only
 
 output:
   # Folders inside the clone kept when source is purged after a scan (the

@@ -495,6 +495,7 @@ def test_apply_plugin_reverts_offbook_forbidden_edit_non_git(tmp_path, monkeypat
 
     monkeypatch.setattr(plugin_runner, "agentic", fake_agentic)
     cfg = config_mod.load(str(_default_config()))
+    cfg._data["models"]["remediate"]["via"] = "cli"  # policy gate is backend-agnostic; stub the cli seam
     ctx = _policy.PolicyContext(gate=RemediationGate(EXAMPLE_POLICY),
                                 playbook=Playbook(), frameworks=set(), enabled=True)
     finding = parse_findings(_REPORT)[0]      # CWE-89 in app/db.py → allowed
@@ -665,6 +666,7 @@ def test_pregate_allowed_cwe_without_playbook_still_runs(tmp_path, monkeypatch):
 
     monkeypatch.setattr(plugin_runner, "agentic", fake_agentic)
     cfg = config_mod.load(str(_default_config()))
+    cfg._data["models"]["remediate"]["via"] = "cli"  # policy gate is backend-agnostic; stub the cli seam
     ctx = _policy.PolicyContext(gate=RemediationGate(EXAMPLE_POLICY),
                                 playbook=Playbook(),
                                 frameworks=set(), enabled=True)
@@ -700,6 +702,7 @@ def test_pregate_allowed_cwe_injects_strategy(tmp_path, monkeypatch):
 
     monkeypatch.setattr(plugin_runner, "agentic", fake_agentic)
     cfg = config_mod.load(str(_default_config()))
+    cfg._data["models"]["remediate"]["via"] = "cli"  # policy gate is backend-agnostic; stub the cli seam
     ctx = _policy.PolicyContext(gate=RemediationGate(EXAMPLE_POLICY),
                                 playbook=Playbook(),
                                 frameworks=set(), enabled=True)
@@ -801,6 +804,7 @@ def test_fix_route_reverts_offbook_forbidden_edit_end_to_end(tmp_path, monkeypat
 
     monkeypatch.setattr(plugin_runner, "agentic", fake_agentic)
     cfg = config_mod.load(str(_default_config()))
+    cfg._data["models"]["remediate"]["via"] = "cli"  # policy gate is backend-agnostic; stub the cli seam
     ctx = _policy.PolicyContext(gate=RemediationGate(EXAMPLE_POLICY),
                                 playbook=Playbook(), frameworks=set(), enabled=True)
     finding = parse_findings(_REPORT)[0]      # CWE-89 in app/db.py → allowed
@@ -833,6 +837,7 @@ def test_remediate_command_policy_off_by_default(tmp_path, monkeypatch):
 
     monkeypatch.setattr(plugin_runner, "agentic", fake)
     cfg = config_mod.load(str(_default_config()))
+    cfg._data["models"]["remediate"]["via"] = "cli"  # policy gate is backend-agnostic; stub the cli seam
     cfg._data.setdefault("step_remediate", {})["enforce_policy"] = False
     repo = _make_scan(tmp_path, _DENY_REPORT)
     assert remediate(str(repo), [], cfg=cfg) == 0

@@ -49,7 +49,8 @@ When reporting, please include as much of the following as you can to help us
 triage quickly:
 
 - The version (or commit) of `vvaharness` affected.
-- The profile/backend in use (`via: cli` / `via: sdk` / `via: openai`) and OS.
+- The profile/backend in use (`via: cli`, `via: sdk`, `via: openai`, or
+  `via: deepagents` plus its provider) and OS.
 - A description of the issue and its security impact.
 - Step-by-step instructions to reproduce.
 - Proof-of-concept or exploit code, if available.
@@ -79,9 +80,10 @@ time to remediate before any public discussion of the issue.
 ## Security considerations
 
 **TL;DR:** `vvaharness` reads repository content and forwards excerpts to the
-configured LLM API (redacted before egress on the sandboxed `via: sdk` /
-`via: openai` backends; on-disk reports are redacted on every backend). Keep
-scan credentials and config outside
+configured model endpoint. SDK/OpenAI tool results and read-only
+DeepAgents tool results are scrubbed, but redaction is not a universal
+pre-egress guarantee for every prompt or backend. On-disk reports are redacted
+on every backend. Keep scan credentials and config outside
 the repositories you scan, restrict tool access in CI/CD, and scope batch jobs
 to repositories your team is authorized to scan.
 
@@ -90,20 +92,22 @@ to repositories your team is authorized to scan.
 File reads through the sandboxed tool loop and the s1 inventory are confined
 to the repository root — symlinks and path traversals that point outside it
 are rejected. Redaction — masking of credentials, private keys, and payment
-card data — is applied at two boundaries: the report write boundary (Markdown
-and SARIF, on every backend) and the outbound tool-content boundary for the
-sandboxed `via: sdk` / `via: openai` backends, where `Read`/`Grep` results are
-scrubbed before they are handed back to the model. The default `via: cli`
-backend drives the `claude` CLI's own filesystem tools, so quoted source on
-that path is masked only at the report write boundary, not before it reaches
-the model. API keys and git tokens are kept in environment variables and sent
-as request credentials; they do not appear in prompts. For full detail see
+card data — is applied at the report write boundary (Markdown and SARIF, on
+every backend). Sandboxed `via: sdk` / `via: openai` tool results are scrubbed
+before returning to the model, as are filesystem reads in read-only
+DeepAgents sessions such as validation. DeepAgents fix-mode remediation permits
+writes and does not promise that same read-result redaction. The default
+`via: cli` detection route drives the `claude` CLI's own filesystem tools, so
+quoted source on that path is masked only at the report boundary, not before it
+reaches the model. API keys and git tokens are kept in environment variables
+and sent as request credentials; they should not appear in prompts. For full detail see
 [`docs/security.md`](docs/security.md).
 
 Batch mode clones each repository into an isolated workspace directory and
 scans it. Unless you pass `--keep-clones`, the clone is removed when the scan
-completes, preserving only the report output folders listed in
-`output.preserve_on_cleanup` (default `security-scan`). See
+completes, preserving only folders listed in `output.preserve_on_cleanup`.
+All shipped profiles currently preserve both `security-scan` and
+`security-remediation`. See
 [`docs/security.md`](docs/security.md) for details.
 
 For a full description of redaction patterns, backend TLS settings, and
@@ -125,9 +129,11 @@ credential handling, see [`docs/security.md`](docs/security.md).
 ### Input handling
 
 As with any analysis tool, `vvaharness` processes repository content as part
-of its normal operation. The pipeline is designed to treat that content as
-data, and all output is produced as report files for human review. Apply the
-same judgement to SARIF output that you would to any automated tool result.
+of its normal operation. Findings and artifacts are produced for human review.
+With remediation enabled, a plain default-profile scan can also edit target
+source when S10 has findings, credentials, and a successful fix-mode session;
+use `--stop-after s9` for detection-only operation. Apply the same judgement to
+SARIF and generated patches that you would to any automated tool result.
 
 ### What not to scan
 

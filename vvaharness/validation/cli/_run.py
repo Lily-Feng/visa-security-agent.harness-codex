@@ -43,12 +43,25 @@ from vvaharness.validation.ingest.manifest_builder import build_manifest
 from vvaharness.validation.ingest.workspace import assert_remediation_applied, stage_workspace
 from vvaharness.validation.io.dto_writeback import write_back_validation
 from vvaharness.validation.models import RemediationReport, RunMetadata, ValidationResult
-from vvaharness.validation.plans import FixValidationPlan
+from vvaharness.validation.models.plans import FixValidationPlan
 from vvaharness.validation.report import augment_reports
 
 # Prefix that ``make_unverifiable`` stamps on ``reason_for_decision`` for a result that
 # represents a hard failure (session/agent error) rather than a real verdict.
 _UNVERIFIABLE_PREFIX = "UNVERIFIABLE:"
+
+
+def _is_hard_failure(result: ValidationResult | None) -> bool:
+    """True when *result* is a session/agent failure rather than a real verdict.
+
+    ``make_unverifiable`` stamps ``_UNVERIFIABLE_PREFIX`` on ``reason_for_decision`` for
+    every such result, which is how a ValidationSessionError surfaces here. A missing
+    result counts as a failure. Single definition shared by the DTO write-back (which must
+    fail closed) and the exit-code accounting, so the two cannot drift apart.
+    """
+    if result is None:
+        return True
+    return result.reason_for_decision.startswith(_UNVERIFIABLE_PREFIX)
 
 
 def _safe(finding_id: str) -> str:
@@ -83,12 +96,10 @@ def _session_log_dest(workspace: Path, report: RemediationReport) -> tuple[Path,
 def _persist_session_log(workspace: Path, report: RemediationReport) -> Path | None:
     """Persist the redacted session transcript next to the finding's remediate_report.json.
 
-    Keeps only the orchestrator ``session.jsonl`` (no s11/ tree, no report copies): reads it,
-    redacts secrets/PII in memory, and writes only the redacted bytes to
-    ``<finding folder>/validation_session_<safe id>.jsonl``. The raw transcript is never
-    copied to disk, so a decode/IO failure cannot leave an unredacted artifact behind — on
-    any failure the partial destination is removed and None is returned. Best-effort audit
-    artifact — never raises.
+    Scoped to the orchestrator ``session.jsonl`` only — no s11/ tree, no report copies.
+    Redaction happens in memory and only redacted bytes are ever written, so a decode/IO
+    failure cannot leave an unredacted artifact behind. Best-effort audit artifact: on any
+    failure the partial destination is removed and None is returned, never raising.
     """
     resolved = _session_log_dest(workspace, report)
     if resolved is None:
@@ -136,17 +147,20 @@ def _validate_one(
     results = asyncio.run(
         execute_plan(plan, run.config, post_results=False, meta=RunMetadata(total_findings=1))
     )
+    result = results[0] if results else None
     record = _persist_session_log(workspace, report)
     if record is not None:
         print(f"  [{VALIDATE_ALIAS_S11}] session log → {record}", file=sys.stderr)
-    status = write_back_validation(report, workspace)
+    status = write_back_validation(
+        report, workspace, session_failed=_is_hard_failure(result)
+    )
     if status is not None:
         print(
             f"  [{VALIDATE_ALIAS_S11}] DTO updated → {report.finding_id}: status={status}",
             file=sys.stderr,
         )
     shutil.rmtree(workspace, ignore_errors=True)
-    return results[0] if results else None
+    return result
 
 
 def _resume_hit(run: ValidationRun, step: str) -> ValidationResult | None:
@@ -186,7 +200,7 @@ def _run_reports(
         if result is None:
             failures += 1  # refused before validation; _validate_one already explained why
             continue
-        if result.reason_for_decision.startswith(_UNVERIFIABLE_PREFIX):
+        if _is_hard_failure(result):
             # A hard failure (agent/session error) — surface it as FAILED, don't pass it
             # off as a normal verdict, and make the run exit non-zero.
             print(f"FAILED: {report.finding_id} — {result.reason_for_decision}", file=sys.stderr)

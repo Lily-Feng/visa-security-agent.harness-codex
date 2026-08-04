@@ -21,7 +21,10 @@ read from a local path) and scanned. With `--group-by-app`, all repos that
 share an `AppId` are staged under one directory and scanned **once**, producing
 one report per application instead of one per repo.
 
-A worked example ships at `inputs/repos.example.csv`. Note: the CSV parser does **not** support `#` comment lines or a leading blank line — the very first row of the file must be the header. (Unlike the `.txt` batch format, which skips `#`-comment and blank lines.)
+A worked example ships at `inputs/repos.example.csv`. Note: the CSV parser does
+**not** support `#` comment lines or a leading blank line — the very first row
+of the file must be the header. (Unlike the `.txt` batch format, which skips
+`#`-comment and blank lines.)
 
 ## Columns
 
@@ -42,6 +45,9 @@ notes, etc. alongside and the parser won't care.
   header (unlike the `.txt` batch format), so the file must start with the
   column header.
 - Encoding: UTF-8 (BOM tolerated).
+- Availability limits: the file may be at most **64 MiB** on disk and contain
+  at most **200,000 data rows**. Larger batches must be split into multiple
+  manifests. Parsing is streamed under both limits.
 - Blank rows are skipped. Rows where both `AppId` and `RepoName` are empty
   are skipped; a row with only one of them is a validation error.
 - Whenever a row needs its URL derived — there is **no `Path` column at all**,
@@ -120,4 +126,3 @@ so its `security-scan/` is written **inside that source directory**, not under
 never inside the source. Either way a `./scans/batch_summary.md` is written.
 
 ---
-

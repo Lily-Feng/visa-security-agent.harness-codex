@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Deterministic host-side scoring from the agent-written ``synthesized_gates.json``.
+"""Deterministic host-side scoring from host-persisted ``synthesized_gates.json``.
 
-The validation agent (sandboxed, no shell) synthesizes the four gate statuses and writes
-them to ``synthesized_gates.json`` with the Write tool. The host then computes the verdict
-here, in-process, via the canonical scoring engine — so the score is exact and identical
-every run, never dependent on the agent's own arithmetic.
+Validation sessions return structured gate statuses; depending on the backend,
+the in-session orchestrator or host code synthesizes persona results. Host code
+writes the gates artifact and computes the verdict here via the canonical
+scoring engine, so agent-authored arithmetic is never authoritative.
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from pathlib import Path
 
 from vvaharness.validation.constants.artifacts import SYNTHESIZED_GATES_FILENAME
 from vvaharness.validation.constants.scoring import SCORE_PRECISION
+from vvaharness.validation.enums.gates import GateStatus
 from vvaharness.validation.enums.readiness import MergeReadiness
 from vvaharness.validation.enums.verdicts import FixVerdict
 from vvaharness.validation.scoring import derive_merge_readiness, score_fix
@@ -84,7 +85,7 @@ def _gates_by_tracking_id(data: list[object]) -> dict[str, list[Mapping[str, obj
 
 
 def load_synthesized_gates(workspace_dir: Path) -> dict[str, list[Mapping[str, object]]]:
-    """Map tracking_id -> raw gate dicts from the agent-written synthesized_gates.json.
+    """Map tracking_id -> raw gate dicts from the host-written synthesized_gates.json.
 
     Returns {} for both an absent and a malformed file, so the caller fails closed
     (recording UNVERIFIABLE) rather than trusting the agent's self-reported verdict.
@@ -123,7 +124,9 @@ def _gate_scores(gates: list[Mapping[str, object]]) -> dict[str, dict[str, objec
     scores: dict[str, dict[str, object]] = {}
     for gate in gates:
         name = str(gate.get("gate_name", ""))
-        gate_status = str(gate.get("status", ""))
+        # Canonicalise as the engine does, or a variant like "PASS" scores 0 here while
+        # the engine scores it 1.0 -- publishing a gate table that contradicts the verdict.
+        gate_status = GateStatus.parse(gate.get("status")).value
         weight = FIX_CONFIG.weights.get(name, 0.0)
         multiplier = FIX_CONFIG.status_multiplier.get(gate_status, 0.0)
         scores[name] = {

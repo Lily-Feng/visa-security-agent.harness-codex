@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from vvaharness.validation.config.settings import (
-    ClaudeConfig,
+    AgentConfig,
     Config,
     GheConfig,
     PathsConfig,
@@ -25,7 +25,7 @@ from vvaharness.validation.config.settings import (
 )
 
 __all__ = [
-    "ClaudeConfig",
+    "AgentConfig",
     "Config",
     "GheConfig",
     "PathsConfig",

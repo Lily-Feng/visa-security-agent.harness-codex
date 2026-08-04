@@ -19,7 +19,7 @@ attachment (disjoint-only, so an overlapping re-detection is not counted as a
 new site), and de-duplication of the collapsed-location set. Pure functions.
 """
 from vvaharness.pipeline.stages import s7_dedup
-from vvaharness.models import Finding, VulnClass
+from vvaharness.models import ContextPackage, Finding, VulnClass
 
 
 def _f(file: str, ls: int, le: int, vc: VulnClass = VulnClass.OTHER) -> Finding:
@@ -42,6 +42,33 @@ def test_collapse_trivial_keeps_disjoint_ranges_separate():
     assert canon == {}
 
 
+def test_collapse_trivial_keeps_overlapping_findings_with_different_cwe():
+    a = _f("svc.py", 40, 45, VulnClass.LOGIC)
+    b = _f("svc.py", 42, 66, VulnClass.LOGIC)
+    a.cwe = "CWE-863"
+    b.cwe = "CWE-778"
+    canon = s7_dedup._collapse_trivial([a, b], line_tol=10)
+    assert canon == {}
+
+
+def test_collapse_trivial_still_merges_when_cwe_matches():
+    a = _f("svc.py", 40, 45, VulnClass.LOGIC)
+    b = _f("svc.py", 42, 66, VulnClass.LOGIC)
+    a.cwe = "CWE-863"
+    b.cwe = "CWE-863"
+    canon = s7_dedup._collapse_trivial([a, b], line_tol=10)
+    assert canon == {1: 0}
+
+
+def test_collapse_trivial_keeps_logic_overlap_when_cwe_missing_on_one_side():
+    a = _f("svc.py", 40, 45, VulnClass.LOGIC)
+    b = _f("svc.py", 42, 66, VulnClass.LOGIC)
+    a.cwe = "CWE-863"
+    b.cwe = None
+    canon = s7_dedup._collapse_trivial([a, b], line_tol=10)
+    assert canon == {}
+
+
 def test_attach_duplicates_skips_same_site_overlap():
     findings = [_f("a.py", 10, 20), _f("a.py", 15, 25)]
     s7_dedup._attach_duplicates(findings, {1: 0}, {1: "dup"})
@@ -59,3 +86,35 @@ def test_attach_duplicates_dedupes_identical_locations():
     findings = [_f("a.py", 10, 12), _f("b.py", 50, 52), _f("b.py", 50, 52)]
     s7_dedup._attach_duplicates(findings, {1: 0, 2: 0}, {1: "d", 2: "d"})
     assert len(findings[0].duplicates) == 1
+
+
+def test_graph_context_for_finding_uses_def_span_candidates():
+    f = _f("src/app.py", 10, 12)
+    f.source_ref = "src/http.py:22"
+    f.sink_ref = "src/app.py:11"
+    ctx = ContextPackage(
+        repo_root="/tmp/repo",
+        language="python",
+        call_graph={
+            "src/http.py::handle": ["src/app.py::danger"],
+            "src/app.py::danger": ["src/db.py::exec"],
+        },
+        def_spans={
+            "src/app.py::danger": [8, 20],
+            "src/http.py::handle": [20, 30],
+        },
+    )
+
+    g = s7_dedup._graph_context_for_finding(f, ctx)
+    assert g["available"] is True
+    assert "src/app.py::danger" in g["qnodes"]
+    around = g["around"]["src/app.py::danger"]
+    assert "src/http.py::handle" in around["callers"]
+    assert "src/db.py::exec" in around["callees"]
+
+
+def test_graph_context_for_finding_handles_missing_graph():
+    f = _f("src/app.py", 10, 12)
+    ctx = ContextPackage(repo_root="/tmp/repo", language="python")
+    g = s7_dedup._graph_context_for_finding(f, ctx)
+    assert g == {"available": False}

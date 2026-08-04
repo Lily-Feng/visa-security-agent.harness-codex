@@ -21,6 +21,7 @@ at step 3.
 """
 from __future__ import annotations
 import re
+from collections import defaultdict
 from enum import Enum
 from typing import Literal
 from pydantic import BaseModel, Field, field_validator
@@ -46,10 +47,12 @@ def _demote_md_headings(text):
 
 
 def _md_cell(text) -> str:
+    # Backslash first: escaping it afterwards would leave an attacker-supplied "\"
+    # consuming the "\" this adds before "|", re-exposing the raw delimiter.
     if text is None:
         return ""
     return (str(text).replace("\r", " ").replace("\n", " ")
-            .replace("|", "\\|").strip())
+            .replace("\\", "\\\\").replace("|", "\\|").strip())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,12 +313,55 @@ class ThreatModel(BaseModel):
             lines.append("")
         return "\n".join(lines)
 
+    def to_compact_prompt_block(self, *, max_assets: int = 8,
+                                max_boundaries: int = 12,
+                                max_threats: int = 12,
+                                max_context_chars: int = 2500) -> str:
+        lines = [
+            "THREAT MODEL:",
+            "",
+            "System context:",
+            self.system_context[:max_context_chars],
+            "",
+        ]
+        if self.assets:
+            assets = self.assets[:max_assets]
+            lines.append(f"Assets ({len(assets)}/{len(self.assets)}):")
+            for a in assets:
+                lines.append(f"  - [{a.sensitivity}] {a.name} — {a.description}")
+            if len(self.assets) > len(assets):
+                lines.append("  …(truncated)")
+            lines.append("")
+        if self.trust_boundaries:
+            bounds = self.trust_boundaries[:max_boundaries]
+            lines.append(f"Trust boundaries ({len(bounds)}/{len(self.trust_boundaries)}):")
+            for b in bounds:
+                ra = ", ".join(b.reachable_assets) or "-"
+                lines.append(f"  - {b.entry_point}: {b.crossing} → assets: {ra}")
+            if len(self.trust_boundaries) > len(bounds):
+                lines.append("  …(truncated)")
+            lines.append("")
+        if self.threats:
+            threats = self.threats[:max_threats]
+            lines.append(f"Ranked threats ({len(threats)}/{len(self.threats)}):")
+            for t in threats:
+                lines.append(
+                    f"  - {t.id} [{t.impact}/{t.likelihood}] {t.threat} "
+                    f"(actor={t.actor}, surface={t.surface}, asset={t.asset}"
+                    + (f", controls: {t.controls}" if t.controls and t.controls != "none" else "")
+                    + ")"
+                )
+            if len(self.threats) > len(threats):
+                lines.append("  …(truncated)")
+            lines.append("")
+        return "\n".join(lines)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 1 output: ContextPackage  (preprocess → strategist, NO raw source code)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_EP_KINDS = {"network", "ipc", "file", "cli", "deserialization", "other"}
+_EP_KINDS = {"network", "ipc", "file", "cli", "deserialization", "framework", "other"}
 _EP_KIND_ALIAS = {
     "rpc": "network", "grpc": "network", "http": "network",
     "https": "network", "rest": "network", "api": "network",
@@ -330,13 +376,14 @@ _EP_KIND_ALIAS = {
     "deserialize": "deserialization", "serde": "deserialization",
     "unmarshal": "deserialization", "parse": "deserialization",
     "pickle": "deserialization", "json": "deserialization",
+    "spring": "framework", "django": "framework", "aspnet": "framework",
 }
 
 
 class EntryPoint(BaseModel):
     file: str
     function: str
-    kind: Literal["network", "ipc", "file", "cli", "deserialization", "other"]
+    kind: Literal["network", "ipc", "file", "cli", "deserialization", "framework", "other"]
     reachable_from_unauth: bool = False
 
     @field_validator("kind", mode="before")
@@ -351,6 +398,11 @@ class Sink(BaseModel):
     line: int = 0
     function: str                    # strcat, memcpy, sprintf, system, ...
     snippet: str = ""                # the offending line, ~120 chars max
+    # CWE ids from the s0 static-seed rule metadata (e.g. ["CWE-89"]).
+    # Propagated to Chunk.sink_cwe in s3 so the s4 confirm/refute prompt can
+    # splice per-CWE sanitizer/non-sanitizer guidance from rules/*.kb.yaml.
+    # Empty for agent-discovered sinks — the KB block simply omits itself.
+    cwe: list[str] = []
 
     @field_validator("line", mode="before")
     @classmethod
@@ -370,11 +422,316 @@ class ModuleInfo(BaseModel):
         return _coerce_int(v, 0)
 
 
+class TaintSymbolRef(BaseModel):
+    qnode: str
+    symbol: str
+    kind: Literal["param", "local", "return", "arg", "field", "container", "property"]
+
+
+class TaintTransferEdge(BaseModel):
+    file: str
+    line: int
+    function_qnode: str
+    src: TaintSymbolRef
+    dst: TaintSymbolRef
+    transfer_kind: Literal[
+        "source", "assign", "arg_to_param", "return_to_local", "return_to_sink", "local_to_sink",
+        "field_write", "field_read", "container_put", "container_get", "sanitize",
+    ]
+
+    @field_validator("transfer_kind", mode="before")
+    @classmethod
+    def _coerce_unknown_kind(cls, v: object) -> object:
+        _known = {
+            "source", "assign", "arg_to_param", "return_to_local", "return_to_sink",
+            "local_to_sink", "field_write", "field_read", "container_put",
+            "container_get", "sanitize",
+        }
+        if isinstance(v, str) and v not in _known:
+            return "assign"
+        return v
+
+
+class TaintEvidencePath(BaseModel):
+    source_ref: str
+    sink_ref: str
+    path_funcs: list[str] = []
+    edges: list[TaintTransferEdge] = []
+    sink_cwe: list[str] = []
+    sanitized: bool = False  # True if the final edge neutralized taint before the sink
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Control-flow graph and reflection/condition-gated taint edges
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CFGNode(BaseModel):
+    """A single basic block in a control-flow graph.
+    
+    Represents a linear sequence of statements without branching.
+    Successors point to block IDs reachable from this node.
+    """
+    block_id: str                    # e.g., "B0", "B1"
+    stmts: list = []                 # tree-sitter nodes or instruction metadata
+    successors: list[str] = []       # block IDs this block can reach
+    condition: str | None = None     # condition text if branch, else None
+
+
+class CFG(BaseModel):
+    """Control-flow graph for a single function.
+    
+    Maps basic blocks and their successors to form the control flow.
+    Entry and exit mark the start and end blocks.
+    """
+    blocks: dict[str, CFGNode] = {}   # mapping block_id to CFGNode
+    entry: str = ""                   # starting block ID, typically "B0"
+    exit: str = ""                    # final block ID
+    function_name: str = ""           # for reference
+
+
+class ConditionTaintEdge(TaintTransferEdge):
+    """Taint transfer gated by a condition.
+    
+    Represents a taint flow where the transfer depends on a condition
+    that may itself be tainted. Used to model conditional assignments
+    and guarded data flows.
+    """
+    transfer_kind: Literal["condition"] = "condition"
+    condition_text: str = ""           # e.g., "is_admin", "user.role == 'admin'"
+    is_tainted_condition: bool = False # does the condition depend on taint source?
+    confidence: Literal["high", "medium"] = "high"
+
+    @field_validator("condition_text", mode="before")
+    @classmethod
+    def _v_condition_text(cls, v):
+        return str(v or "").strip()
+
+
+class ReflectionFact(BaseModel):
+    """A reflective/dynamic dispatch call.
+    
+    Captures calls to dynamic resolution mechanisms like getMethod,
+    invoke, getattr, construct, or delegate patterns. Used to model
+    reflection and dependency injection in the taint graph.
+    """
+    function_qnode: str              # qualified node of the function
+    line: int = 0                    # source line
+    call_type: Literal["getmethod", "invoke", "getattr", "construct", "delegate"] = "invoke"
+    target_symbols: list[str] = []   # symbols passed to getMethod/getattr/etc.
+    receiver: str = ""               # object on which reflection is called
+    language: Literal["python", "java", "csharp"] = "python"
+
+    @field_validator("line", mode="before")
+    @classmethod
+    def _v_line(cls, v):
+        return _coerce_int(v, 0)
+
+    @field_validator("call_type", mode="before")
+    @classmethod
+    def _v_call_type(cls, v):
+        _known = {"getmethod", "invoke", "getattr", "construct", "delegate"}
+        if isinstance(v, str):
+            norm = _norm(v)
+            if norm in _known:
+                return norm
+        return "invoke"
+
+
+class ReflectionTaintEdge(TaintTransferEdge):
+    """Taint transfer via reflection.
+    
+    Represents a taint flow through dynamically resolved methods or
+    functions. Confidence reflects how well the reflection target
+    could be resolved statically.
+    """
+    transfer_kind: Literal["reflect"] = "reflect"
+    reflected_targets: list[str] = []  # resolved target method/class QNames
+    confidence: Literal["low", "medium", "high"] = "medium"
+    is_speculative: bool = True        # this edge is inferred, not explicit
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _v_confidence(cls, v):
+        _known = {"low", "medium", "high"}
+        return _coerce_enum(v, _known, {}, "medium")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Framework-level source detection and route/response dataflow
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FrameworkMarkerFact(BaseModel):
+    """Framework-specific source or entry point marker.
+    
+    Captures framework annotations, decorators, and implicit type-based
+    markers that indicate user-controlled input sources (e.g., @RequestParam,
+    request.GET, @FromQuery). Used to identify sources from web framework
+    entry points without explicit type tainting.
+    """
+    function_qnode: str
+    line: int = 0
+    marker_type: Literal[
+        "spring_annotation", "django_view", "aspnet_annotation",
+        "spring_implicit", "django_dict_access", "aspnet_implicit"
+    ] = "spring_annotation"
+    marker_name: str                   # e.g., "@RequestParam", "request.GET", "@FromQuery"
+    parameter_names: list[str] = []    # Which parameters are tainted by this marker
+    framework: Literal["spring", "django", "aspnet"] = "spring"
+    confidence: Literal["high", "medium"] = "high"  # high for explicit, medium for implicit
+
+    @field_validator("line", mode="before")
+    @classmethod
+    def _v_line(cls, v):
+        return _coerce_int(v, 0)
+
+    @field_validator("marker_type", mode="before")
+    @classmethod
+    def _v_marker_type(cls, v):
+        _known = {"spring_annotation", "django_view", "aspnet_annotation",
+                  "spring_implicit", "django_dict_access", "aspnet_implicit"}
+        _alias = {
+            "spring": "spring_annotation",
+            "django": "django_view",
+            "aspnet": "aspnet_annotation",
+            "request.get": "django_dict_access",
+            "request.post": "django_dict_access",
+        }
+        return _coerce_enum(v, _known, _alias, "spring_annotation")
+
+    @field_validator("framework", mode="before")
+    @classmethod
+    def _v_framework(cls, v):
+        _known = {"spring", "django", "aspnet"}
+        return _coerce_enum(v, _known, {}, "spring")
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _v_confidence(cls, v):
+        _known = {"high", "medium"}
+        return _coerce_enum(v, _known, {"explicit": "high", "implicit": "medium"}, "high")
+
+
+class RouteTaintFact(BaseModel):
+    """Framework route parameter binding taint fact.
+    
+    Represents a framework route with path parameters that are bound to
+    function arguments. Route parameters extracted from URL patterns are
+    inherently tainted (user-controlled). Used to model route parameter
+    sources in Spring, Django, and ASP.NET applications.
+    """
+    function_qnode: str
+    line: int = 0
+    route_pattern: str                 # e.g., "/user/{id}", "user/<int:id>/", "users/{userId}"
+    parameter_name: str                # e.g., "id", "userId"
+    is_tainted: bool = True            # URL parameters are always tainted
+    framework: Literal["spring", "django", "aspnet"] = "spring"
+
+    @field_validator("line", mode="before")
+    @classmethod
+    def _v_line(cls, v):
+        return _coerce_int(v, 0)
+
+    @field_validator("framework", mode="before")
+    @classmethod
+    def _v_framework(cls, v):
+        _known = {"spring", "django", "aspnet"}
+        return _coerce_enum(v, _known, {}, "spring")
+
+
+class ResponseDataflowFact(BaseModel):
+    """Data flow from computation to response output sink.
+    
+    Tracks flows from intermediate variables or return values to response
+    output sinks (e.g., JsonResponse, HttpResponse, Ok, render). Used to
+    identify where tainted data reaches response boundaries and may cause
+    injection vulnerabilities (XSS, XXE, SSTI, etc.).
+    """
+    function_qnode: str
+    line: int = 0
+    from_symbol: str                   # Variable flowing into response
+    to_sink: str                       # Response sink (e.g., "JsonResponse", "HttpResponse", "Ok")
+    framework: Literal["spring", "django", "aspnet"] = "spring"
+    response_type: Literal["json", "html", "text", "xml"] = "json"
+
+    @field_validator("line", mode="before")
+    @classmethod
+    def _v_line(cls, v):
+        return _coerce_int(v, 0)
+
+    @field_validator("framework", mode="before")
+    @classmethod
+    def _v_framework(cls, v):
+        _known = {"spring", "django", "aspnet"}
+        return _coerce_enum(v, _known, {}, "spring")
+
+    @field_validator("response_type", mode="before")
+    @classmethod
+    def _v_response_type(cls, v):
+        _known = {"json", "html", "text", "xml"}
+        _alias = {
+            "response": "html",
+            "jsonresponse": "json",
+            "httpresponse": "html",
+            "render": "html",
+            "ok": "json",
+            "content": "text",
+        }
+        return _coerce_enum(v, _known, _alias, "json")
+
+
+class FrameworkTaintEdge(TaintTransferEdge):
+    """Taint transfer via framework infrastructure.
+    
+    Represents a taint flow through framework-managed entry points,
+    route bindings, or response construction. Extends TaintTransferEdge
+    to capture transfers that occur within framework-provided mechanisms
+    (e.g., Spring request binding, Django view decorators, ASP.NET model binding).
+    """
+    transfer_kind: Literal["framework"] = "framework"
+    marker_type: Literal[
+        "spring_annotation", "django_view", "aspnet_annotation",
+        "spring_implicit", "django_dict_access", "aspnet_implicit"
+    ] = "spring_annotation"
+    framework: Literal["spring", "django", "aspnet"] = "spring"
+    confidence: Literal["high", "medium"] = "high"
+
+    @field_validator("marker_type", mode="before")
+    @classmethod
+    def _v_marker_type(cls, v):
+        _known = {"spring_annotation", "django_view", "aspnet_annotation",
+                  "spring_implicit", "django_dict_access", "aspnet_implicit"}
+        _alias = {
+            "spring": "spring_annotation",
+            "django": "django_view",
+            "aspnet": "aspnet_annotation",
+        }
+        return _coerce_enum(v, _known, _alias, "spring_annotation")
+
+    @field_validator("framework", mode="before")
+    @classmethod
+    def _v_framework(cls, v):
+        _known = {"spring", "django", "aspnet"}
+        return _coerce_enum(v, _known, {}, "spring")
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _v_confidence(cls, v):
+        _known = {"high", "medium"}
+        return _coerce_enum(v, _known, {"explicit": "high", "implicit": "medium"}, "high")
+
+
 class ContextPackage(BaseModel):
     repo_root: str
     language: str                    # primary language detected
     call_graph: dict[str, list[str]] = {}     # caller_fqn -> [callee_fqn]
     call_graph_files: dict[str, list[str]] = {}   # fn -> ["file:line", …] (deterministic def-sites from s1 supplement)
+    def_spans: dict[str, list[int]] = {}      # qnode -> [start_line, end_line]; tree-sitter only — feeds s3/s4 function slicing
+    # s0 semgrep codeFlows: each path is ["rel/path:line", …] source→…→sink.
+    # Consumed by s3._reachable_files so a file semgrep PROVED is on a taint
+    # path can never be dropped by catchall_mode=reachable_only even when the
+    # call-graph missed the edge (reflection/DI/dynamic dispatch).
+    seed_taint_paths: list[list[str]] = []
+    seed_taint_evidence: list[TaintEvidencePath] = []
     entry_points: list[EntryPoint] = []
     unsafe_sinks: list[Sink] = []
     modules: list[ModuleInfo] = []
@@ -386,7 +743,154 @@ class ContextPackage(BaseModel):
     threat_model: ThreatModel | None = None   # s2 output, attached to ctx after s2
     notes: str = ""                           # free-form Opus observations
 
-    def to_prompt_block(self) -> str:
+    def ast_context_view(self, *, max_files: int = 250, max_entry_points: int = 120,
+                         max_sinks: int = 160, max_modules: int = 40,
+                         max_edges: int = 120, max_notes_chars: int = 4000) -> "ContextPackage":
+        seed_files: list[str] = []
+        _seen: set[str] = set()
+
+        def _add_file(path: str) -> None:
+            norm = path.replace("\\", "/")
+            while norm.startswith("./"):
+                norm = norm[2:]
+            if norm and norm not in _seen:
+                _seen.add(norm)
+                seed_files.append(norm)
+
+        for entry in self.entry_points[:max_entry_points]:
+            _add_file(entry.file)
+        for sink in self.unsafe_sinks[:max_sinks]:
+            _add_file(sink.file)
+        for path in self.seed_taint_paths:
+            for node in path:
+                _add_file(node.split(":", 1)[0])
+        for sites in self.call_graph_files.values():
+            for site in sites[:2]:
+                _add_file(site.split(":", 1)[0])
+        for module in self.modules[:max_modules]:
+            for path in module.files[:5]:
+                _add_file(path)
+
+        all_files: list[str] = []
+        all_files_set = set(self.all_files)
+        seen_all: set[str] = set()
+        for path in seed_files:
+            if path in all_files_set and path not in seen_all:
+                seen_all.add(path)
+                all_files.append(path)
+                if len(all_files) >= max_files:
+                    break
+        if len(all_files) < max_files:
+            for path in self.all_files:
+                if path not in seen_all:
+                    seen_all.add(path)
+                    all_files.append(path)
+                    if len(all_files) >= max_files:
+                        break
+
+        allowed_files = set(all_files)
+        entry_points = [e for e in self.entry_points if e.file in allowed_files][:max_entry_points]
+        unsafe_sinks = [s for s in self.unsafe_sinks if s.file in allowed_files][:max_sinks]
+
+        modules = []
+        for module in self.modules:
+            kept = [path for path in module.files if path in allowed_files][:10]
+            if kept:
+                modules.append(module.model_copy(update={"files": kept}))
+            if len(modules) >= max_modules:
+                break
+
+        ep_fqns = {f"{e.file}::{e.function}" for e in entry_points}
+        sink_fqns = {f"{s.file}::{s.function}" for s in unsafe_sinks}
+        # Bare-name fallback for nodes whose file part is missing (agent-emitted
+        # unqualified names survive as bare strings until s1 qualifies them).
+        ep_bare = {e.function for e in entry_points}
+        sink_bare = {s.function for s in unsafe_sinks}
+
+        def _bare(name: str) -> str:
+            return name.rpartition("::")[2]
+
+        def _is_hot(caller: str, callee: str) -> bool:
+            return (
+                caller in ep_fqns or caller in sink_fqns
+                or callee in ep_fqns or callee in sink_fqns
+                or ("::" not in caller and (_bare(caller) in ep_bare or _bare(caller) in sink_bare))
+                or ("::" not in callee and (_bare(callee) in ep_bare or _bare(callee) in sink_bare))
+            )
+
+        def _edges():
+            for caller, callees in self.call_graph.items():
+                for callee in dict.fromkeys(c for c in callees if c):
+                    yield caller, callee
+
+        trimmed_graph: dict[str, list[str]] = defaultdict(list)
+        total_edges = 0
+        # Emit hot edges before cold edges (that order decides which survive the
+        # max_edges cut), but classify lazily and stop at the cut instead of
+        # materializing every edge into three lists first.
+        for want_hot in (True, False):
+            if total_edges >= max_edges:
+                break
+            for caller, callee in _edges():
+                if _is_hot(caller, callee) != want_hot:
+                    continue
+                cf = caller.split("::", 1)[0] if "::" in caller else ""
+                tf = callee.split("::", 1)[0] if "::" in callee else ""
+                if cf and cf not in allowed_files and tf and tf not in allowed_files:
+                    continue
+                trimmed_graph[caller].append(callee)
+                total_edges += 1
+                if total_edges >= max_edges:
+                    break
+
+        kept_functions = set(trimmed_graph)
+        for callees in trimmed_graph.values():
+            kept_functions.update(callees)
+
+        trimmed_graph_files = {
+            fn: [site for site in sites if site.split(":", 1)[0] in allowed_files][:3]
+            for fn, sites in self.call_graph_files.items()
+            if fn in kept_functions and any(site.split(":", 1)[0] in allowed_files for site in sites)
+        }
+        trimmed_def_spans = {
+            fn: span for fn, span in self.def_spans.items() if fn in kept_functions
+        }
+        trimmed_paths = []
+        for path in self.seed_taint_paths:
+            kept = [node for node in path if node.split(":", 1)[0] in allowed_files]
+            if kept:
+                trimmed_paths.append(kept[:8])
+
+        trimmed_evidence = []
+        for evidence in self.seed_taint_evidence:
+            source_file = evidence.source_ref.split(":", 1)[0]
+            sink_file = evidence.sink_ref.split(":", 1)[0]
+            if source_file not in allowed_files or sink_file not in allowed_files:
+                continue
+            trimmed_evidence.append(evidence.model_copy(update={
+                "edges": evidence.edges[:24],
+            }))
+            if len(trimmed_evidence) >= 60:
+                break
+
+        notes = self.notes[:max_notes_chars]
+        if len(self.notes) > max_notes_chars:
+            notes = notes.rstrip() + "\n[truncated for AST frontier prompt]"
+
+        return self.model_copy(update={
+            "all_files": all_files,
+            "entry_points": entry_points,
+            "unsafe_sinks": unsafe_sinks,
+            "modules": modules,
+            "call_graph": dict(trimmed_graph),
+            "call_graph_files": trimmed_graph_files,
+            "def_spans": trimmed_def_spans,
+            "seed_taint_paths": trimmed_paths,
+            "seed_taint_evidence": trimmed_evidence,
+            "notes": notes,
+        })
+
+    def to_prompt_block(self, max_edges: int = 400) -> str:
         """Compact text representation for the strategist LLM. Never include raw code."""
         lines = [
             f"REPO: {self.repo_root}  LANG: {self.language}",
@@ -416,7 +920,7 @@ class ContextPackage(BaseModel):
             lines += sigs
             lines.append("")
         if self.call_graph:
-            lines += self._call_graph_block()
+            lines += self._call_graph_block(max_edges=max_edges)
             lines.append("")
         if self.known_cves:
             lines.append(f"KNOWN CVEs ({len(self.known_cves)}) — DO NOT REDISCOVER:")
@@ -438,6 +942,87 @@ class ContextPackage(BaseModel):
             lines.append(f"OPUS NOTES:\n{self.notes}")
         return "\n".join(lines)
 
+    def to_decompose_prompt_block(self) -> str:
+        """Method-centric text representation for Step 3 strategist prompts.
+
+        This deliberately avoids repo-wide file inventories. The strategist only
+        needs structural anchors for risk ranking; deterministic taint/catch-all
+        passes preserve full-file coverage after s3.
+        """
+        lines = [
+            f"REPO: {self.repo_root}  LANG: {self.language}",
+            "",
+            f"MODULES ({len(self.modules)}):",
+        ]
+        for m in self.modules:
+            lines.append(f"  - {m.name} ({m.loc} loc): {m.purpose}")
+        lines.append("")
+        lines.append(f"ENTRY POINTS ({len(self.entry_points)}):")
+        for e in self.entry_points:
+            unauth = " [UNAUTH-REACHABLE]" if e.reachable_from_unauth else ""
+            lines.append(f"  - {e.kind}: {e.function} @ {e.file}{unauth}")
+        lines.append("")
+        lines.append(f"UNSAFE SINKS ({len(self.unsafe_sinks)}):")
+        for s in self.unsafe_sinks:
+            lines.append(f"  - {s.function} @ {s.file}:{s.line}")
+        lines.append("")
+        sites = self._function_sites_block()
+        if sites:
+            lines += sites
+            lines.append("")
+        sigs = self._signatures_block(body_lines=1, cap=40)
+        if sigs:
+            lines += sigs
+            lines.append("")
+        if self.call_graph:
+            lines += self._call_graph_block_full()
+            lines.append("")
+        if self.known_cves:
+            lines.append(f"KNOWN CVEs ({len(self.known_cves)}) — DO NOT REDISCOVER:")
+            for c in self.known_cves:
+                lines.append(f"  - {c.id}: {c.summary}")
+            lines.append("")
+        if self.design_controls:
+            lines.append(f"DESIGN CONTROLS ({len(self.design_controls)}):")
+            for c in self.design_controls[:40]:
+                prot = ", ".join(c.protects) if c.protects else "global"
+                lines.append(f"  - [{c.kind}] {c.name} → protects: {prot}")
+            lines.append("")
+        if self.app_profile:
+            lines.append(self.app_profile.to_prompt_block())
+            lines.append("")
+        if self.threat_model:
+            lines.append(self.threat_model.to_compact_prompt_block())
+        if self.notes:
+            lines.append(f"OPUS NOTES:\n{self.notes[:3000]}")
+        return "\n".join(lines)
+
+    def _function_sites_block(self, cap: int = 120) -> list[str]:
+        out = ["FUNCTION SITES (use these method/file anchors when grouping related files into one chunk):"]
+        count = 0
+        seen: set[tuple[str, str]] = set()
+        for fn, sites in self.call_graph_files.items():
+            uniq_sites = []
+            for site in sites:
+                file_part = site.split(":", 1)[0]
+                marker = (fn, file_part)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                uniq_sites.append(site)
+            if not uniq_sites:
+                continue
+            span = self.def_spans.get(fn)
+            span_txt = f" lines {span[0]}-{span[1]}" if span and len(span) == 2 else ""
+            out.append(f"  - {fn} @ {', '.join(uniq_sites[:3])}{span_txt}")
+            count += 1
+            if count >= cap:
+                remaining = max(0, len(self.call_graph_files) - count)
+                if remaining:
+                    out.append(f"  … ({remaining} more function sites truncated)")
+                break
+        return out if count else []
+
     def _call_graph_block(self, max_edges: int = 400) -> list[str]:
         """
         Render call_graph for the s3 strategist. Edges that touch an entry
@@ -445,27 +1030,70 @@ class ContextPackage(BaseModel):
         paths the strategist is told to keep in one chunk); the rest are
         appended up to `max_edges`.
         """
-        ep_funcs = {e.function for e in self.entry_points}
-        sink_funcs = {s.function for s in self.unsafe_sinks}
+        ep_fqns = {f"{e.file}::{e.function}" for e in self.entry_points}
+        sink_fqns = {f"{s.file}::{s.function}" for s in self.unsafe_sinks}
+        ep_bare = {e.function for e in self.entry_points}
+        sink_bare = {s.function for s in self.unsafe_sinks}
         bare = lambda qn: qn.rpartition("::")[2]
+
+        def _hot(caller: str, callee: str) -> bool:
+            return (
+                caller in ep_fqns or caller in sink_fqns
+                or callee in ep_fqns or callee in sink_fqns
+                or ("::" not in caller and (bare(caller) in ep_bare or bare(caller) in sink_bare))
+                or ("::" not in callee and (bare(callee) in ep_bare or bare(callee) in sink_bare))
+            )
+
         hot, cold = [], []
         for caller, callees in self.call_graph.items():
             uniq = list(dict.fromkeys(c for c in callees if c))
             if not uniq:
                 continue
-            line = f"  - {caller} -> {', '.join(uniq)}"
-            if bare(caller) in ep_funcs or bare(caller) in sink_funcs \
-                    or any(bare(c) in sink_funcs or bare(c) in ep_funcs
-                           for c in uniq):
-                hot.append(line)
-            else:
-                cold.append(line)
+            for callee in uniq:
+                line = f"  - {caller} -> {callee}"
+                if _hot(caller, callee):
+                    hot.append(line)
+                else:
+                    cold.append(line)
         ordered = hot + cold
         n_total = len(ordered)
         out = [f"CALL GRAPH ({n_total} edges — group caller+callee files in the SAME chunk):"]
         out += ordered[:max_edges]
         if n_total > max_edges:
             out.append(f"  … ({n_total - max_edges} more edges truncated)")
+        return out
+
+    def _call_graph_block_full(self) -> list[str]:
+        """Render the entire frontier call_graph without additional clipping."""
+        ep_fqns = {f"{e.file}::{e.function}" for e in self.entry_points}
+        sink_fqns = {f"{s.file}::{s.function}" for s in self.unsafe_sinks}
+        ep_bare = {e.function for e in self.entry_points}
+        sink_bare = {s.function for s in self.unsafe_sinks}
+        bare = lambda qn: qn.rpartition("::")[2]
+
+        def _hot(caller: str, callee: str) -> bool:
+            return (
+                caller in ep_fqns or caller in sink_fqns
+                or callee in ep_fqns or callee in sink_fqns
+                or ("::" not in caller and (bare(caller) in ep_bare or bare(caller) in sink_bare))
+                or ("::" not in callee and (bare(callee) in ep_bare or bare(callee) in sink_bare))
+            )
+
+        hot, cold = [], []
+        for caller, callees in self.call_graph.items():
+            uniq = list(dict.fromkeys(c for c in callees if c))
+            if not uniq:
+                continue
+            for callee in uniq:
+                line = f"  - {caller} -> {callee}"
+                if _hot(caller, callee):
+                    hot.append(line)
+                else:
+                    cold.append(line)
+        ordered = hot + cold
+        n_total = len(ordered)
+        out = [f"CALL GRAPH ({n_total} edges — group caller+callee files in the SAME chunk):"]
+        out += ordered
         return out
 
     def _signatures_block(self, body_lines: int = 3, cap: int = 60) -> list[str]:
@@ -500,7 +1128,15 @@ class ContextPackage(BaseModel):
             hi = min(len(src), anchor + 1 + body_lines)
             out.append(f"  [{tag}] {file}:{anchor + 1} {fn}()")
             for ln in src[anchor:hi]:
-                out.append(f"      {ln.rstrip()[:160]}")
+                text = ln.rstrip()
+                stripped = text.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith("#") or stripped.startswith("//"):
+                    continue
+                if stripped in {'"""', "'''", '/**', '*/', '*'}:
+                    continue
+                out.append(f"      {text[:160]}")
 
         for e in self.entry_points:
             _emit("ENTRY", e.file, e.function, 0)
@@ -542,6 +1178,13 @@ class Chunk(BaseModel):
     threat_id: str | None = None     # ThreatModel.threats[].id this chunk tests (coverage metric)
     languages: list[str] = []        # detected from file extensions (s3)
     specialist: str | None = None    # "crypto" | "logic-bug" → repo-wide pass
+    # ── taint-chunk metadata (populated by s3 for entry→…→sink chunks; empty
+    #    on risk/specialist/catch-all chunks). Drives s4 function-slice loading
+    #    and the confirm/refute prompt under the taint.yaml profile.
+    path_funcs: list[str] = []       # qnodes on the BFS path, entry → … → sink
+    source_ref: str = ""             # "file::function" — the EntryPoint
+    sink_ref: str = ""               # "file:line" — the Sink location
+    sink_cwe: list[str] = []         # CWE tags from s0 rule metadata (confirm/refute focus)
 
     @field_validator("size", mode="before")
     @classmethod
@@ -557,6 +1200,10 @@ class Chunk(BaseModel):
 class TaskManifest(BaseModel):
     chunks: list[Chunk]
     rationale: str                   # strategist explains its ranking
+    # Files dropped by step3.catchall_mode=reachable_only — listed in the
+    # report appendix (output.emit_unreachable_appendix) so coverage is
+    # auditable, never silently truncated. Empty under default.yaml.
+    unreachable_files: list[str] = []
 
     def sorted_chunks(self) -> list[Chunk]:
         return sorted(self.chunks, key=lambda c: c.risk_rank)
@@ -616,6 +1263,7 @@ class Finding(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     votes: int = 1                   # set by intersection logic (1..N runs)
     duplicates: list[DupLocation] = []  # call sites collapsed into this canonical by s7_dedup
+    backfilled_refs: list[str] = []  # "source_ref"/"sink_ref" synthesized by s5 AST backfill, not derived by s4
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -759,6 +1407,10 @@ class FinalReport(BaseModel):
     metrics: ScanMetrics | None = None
     threat_model: ThreatModel | None = None
     app_profile: AppProfile | None = None
+    # step3.catchall_mode=reachable_only — files NOT reviewed because they
+    # weren't on any entry→…→sink call-graph path. Rendered as an appendix so
+    # the report never silently truncates coverage.
+    unreachable_files: list[str] = []
     summary: str
     degraded: bool = False
     degraded_reason: str = ""
@@ -925,7 +1577,7 @@ class FinalReport(BaseModel):
                            else "DUP (pre-verify)")
                 else:
                     tag = _tag.get(d.reason, d.reason)
-                out.append(f"- **[{tag}]** `{d.file}:{d.line}` "
+                out.append(f"- **[{tag}]** `{_md_cell(d.file).replace(chr(96), chr(0x2CB))}:{d.line}` "
                            f"{d.vuln_class.value} ({_md_cell(d.chunk_id)}) — "
                            f"{_md_cell(d.detail)}")
         else:
@@ -933,7 +1585,40 @@ class FinalReport(BaseModel):
         out.append("")
         if self.metrics:
             out.extend(self._render_scope_appendix())
+        if self.unreachable_files:
+            out.extend(self._render_unreachable_appendix())
         return "\n".join(out)
+
+    def _render_unreachable_appendix(self) -> list[str]:
+        """Appendix listing files dropped by step3.catchall_mode=reachable_only.
+        Caps the inline list so a 10k-file monorepo doesn't bloat the report;
+        the full list is in the s3 checkpoint."""
+        n = len(self.unreachable_files)
+        cap = 200
+        out = [
+            "",
+            "## Appendix — Files Not Sent for Catch-All Review (call-graph unreachable)",
+            "",
+            f"`step3.catchall_mode: reachable_only` dropped **{n}** file(s) "
+            f"that were neither forward-reachable from any entry point nor "
+            f"backward-reachable from any sink on the call graph. They were "
+            f"**not** sent for catch-all review, but remain covered by the "
+            f"specialist passes (logic-bug always; access-control/crypto when "
+            f"enabled). To send them for catch-all review too, re-scan with "
+            f"`--config profiles/default.yaml` (catchall_mode: all).",
+            "",
+        ]
+        for f in self.unreachable_files[:cap]:
+            # Repo-controlled file paths: neutralise Markdown the same way the
+            # rest of this renderer does (_md_cell strips CR/LF and escapes `|`),
+            # and additionally replace backticks so a hostile filename cannot
+            # close this code span and inject content into the coverage audit.
+            out.append(f"- `{_md_cell(f).replace(chr(96), chr(0x2CB))}`")
+        if n > cap:
+            out.append(f"- _… and {n - cap} more (full list in the s3 "
+                       f"checkpoint manifest)_")
+        out.append("")
+        return out
 
     def _render_threat_model(self) -> list[str]:
         tm = self.threat_model

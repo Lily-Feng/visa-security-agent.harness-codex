@@ -21,12 +21,15 @@ Edit/NotebookEdit denial, Write allowlist, and the Bash blocklist + redirect gat
 from pathlib import Path
 
 import pytest
-from vvaharness.validation.backends.contract.permissions import PermissionsPolicy
+from vvaharness.backends.harness.contract.permissions import PermissionsPolicy
+from vvaharness.validation.constants.policy import DEFAULT_ALLOWED_OUTPUT_FILES
 
 
 @pytest.fixture
 def policy(tmp_path: Path) -> PermissionsPolicy:
-    return PermissionsPolicy(target_dir=tmp_path)
+    return PermissionsPolicy(
+        target_dir=tmp_path, allowed_output_files=DEFAULT_ALLOWED_OUTPUT_FILES
+    )
 
 
 def _allowed(policy: PermissionsPolicy, tool: str, **inp: object) -> bool:

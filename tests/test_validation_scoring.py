@@ -24,11 +24,10 @@ from collections.abc import Mapping
 
 import pytest
 from vvaharness.validation.enums.gates import GateName, GateStatus
-from vvaharness.validation.scoring.__main__ import (
-    _normalize_input,
-    _normalize_list,
-    _normalize_mapping,
-)
+from vvaharness.validation.enums.verdicts import FixVerdict
+from vvaharness.validation.io._host_score import _gate_scores
+from vvaharness.validation.scoring import derive_merge_readiness, score_fix
+from vvaharness.validation.scoring._configs import FIX_CONFIG
 from vvaharness.validation.scoring._engine import (
     RawCriterion,
     RawEvidence,
@@ -266,14 +265,15 @@ class TestSkipAndClamp:
 
 
 # ---------------------------------------------------------------------------
-# renormalization: skip is weight-neutral; a coverage floor guards thin verdicts
+# renormalization: skip is weight-neutral; thin coverage is guarded by the critical
+# gates, not by an aggregate weight threshold
 # ---------------------------------------------------------------------------
 
 class TestRenormalization:
     def test_cross_repo_two_skips_still_fixed(self) -> None:
         # Cross-repo persona by design skips no_new_vulnerabilities +
-        # security_best_practices; the two passing gates (active 0.6767 >= floor)
-        # renormalize to a clean Fixed instead of being deflated by the skips.
+        # security_best_practices; the two passing gates renormalize to a clean Fixed
+        # instead of being deflated by the skips.
         gates = [
             RawCriterion(name="root_cause", status="pass", summary="ok"),
             RawCriterion(name="instance_coverage", status="pass", summary="ok"),
@@ -284,8 +284,25 @@ class TestRenormalization:
         assert result.raw_score == pytest.approx(1.0, abs=1e-4)
         assert result.verdict_label == "Fixed"
 
-    def test_single_gate_below_floor_is_unverifiable(self) -> None:
-        # Only root_cause evaluated (active 0.43 < 0.50 floor) → too little coverage.
+    def test_single_gate_is_unverifiable_via_critical_gate(self) -> None:
+        # Only root_cause evaluated. The retired coverage floor used to catch this by
+        # aggregate weight; the critical-gate check catches it outright and unwaivably,
+        # because skipping no_new_vulnerabilities is itself UNVERIFIABLE.
+        gates = [
+            RawCriterion(name="root_cause", status="pass", summary="ok"),
+            RawCriterion(name="instance_coverage", status="skip"),
+            RawCriterion(name="no_new_vulnerabilities", status="skip"),
+            RawCriterion(name="security_best_practices", status="skip"),
+        ]
+        result = score(_CRIT_CFG, gates)
+        assert result.verdict_label == "UNVERIFIABLE"
+        assert result.raw_score == 0.0
+        assert "no_new_vulnerabilities" in result.justification
+
+    def test_thin_coverage_scores_without_critical_gates(self) -> None:
+        # Documents the consequence of retiring the floor: a config that pins no critical
+        # gates now scores a single evaluated gate rather than refusing it. Every shipped
+        # config pins critical gates, so this shape is unreachable in production.
         gates = [
             RawCriterion(name="root_cause", status="pass", summary="ok"),
             RawCriterion(name="instance_coverage", status="skip"),
@@ -293,12 +310,11 @@ class TestRenormalization:
             RawCriterion(name="security_best_practices", status="skip"),
         ]
         result = score(_CFG, gates)
-        assert result.verdict_label == "UNVERIFIABLE"
-        assert result.raw_score == 0.0
-        assert "insufficient gate coverage" in result.justification
+        assert result.raw_score == pytest.approx(1.0, abs=1e-4)
 
     def test_all_skip_is_unverifiable_no_zero_division(self) -> None:
         # Active weight 0.0 must short-circuit to UNVERIFIABLE, never ZeroDivisionError.
+        # This is the sole remaining purpose of the zero guard in _renormalized_score.
         gates = [
             RawCriterion(name="root_cause", status="skip"),
             RawCriterion(name="instance_coverage", status="skip"),
@@ -308,6 +324,7 @@ class TestRenormalization:
         result = score(_CFG, gates)
         assert result.verdict_label == "UNVERIFIABLE"
         assert result.raw_score == 0.0
+        assert "no gates were evaluated" in result.justification
 
     def test_no_skip_cases_unchanged(self) -> None:
         # Regression: with no skips active_weight == 1.0, so renormalization is a no-op.
@@ -487,54 +504,76 @@ class TestBuildFixJustification:
 
 
 # ---------------------------------------------------------------------------
-# _normalize_* (scoring/__main__.py)
+# _gate_scores: the published gate table must never contradict the verdict
+#
+# A second, diverging gate-table builder used to live in scoring/__main__.py and
+# skipped status canonicalisation, so a case variant like "PASS" scored 0.0 in the
+# table while the engine scored the same input Fixed/1.0. These lock that class of
+# divergence out of the one remaining builder.
 # ---------------------------------------------------------------------------
 
-_GATE = {"gate_name": "root_cause", "status": "pass"}
-_FINDING = {"tracking_id": "abc", "gates": [_GATE]}
-
-class TestNormalizeMapping:
-    def test_findings_shape(self) -> None:
-        data = {"findings": [_FINDING]}
-        result = _normalize_mapping(data)
-        assert result == [_FINDING]
-
-    def test_single_finding_with_gates(self) -> None:
-        result = _normalize_mapping(_FINDING)
-        assert result == [_FINDING]
-
-    def test_unknown_shape_returns_none(self) -> None:
-        assert _normalize_mapping({"foo": "bar"}) is None
+_GATE_NAMES = ("root_cause", "instance_coverage", "no_new_vulnerabilities",
+               "security_best_practices")
 
 
-class TestNormalizeList:
-    def test_bare_list_of_gates(self) -> None:
-        result = _normalize_list([_GATE])
-        assert len(result) == 1
-        assert result[0]["gates"] == [_GATE]
-        assert result[0]["tracking_id"] == ""
-
-    def test_list_of_findings(self) -> None:
-        result = _normalize_list([_FINDING])
-        assert result == [_FINDING]
-
-    def test_empty_list(self) -> None:
-        assert _normalize_list([]) == []
+def _gates(status: str, names: tuple[str, ...] = _GATE_NAMES) -> list[Mapping[str, object]]:
+    return [{"gate_name": name, "status": status} for name in names]
 
 
-class TestNormalizeInput:
-    def test_findings_mapping(self) -> None:
-        result = _normalize_input({"findings": [_FINDING]})
-        assert result == [_FINDING]
+class TestGateTableAgreesWithVerdict:
+    def test_uppercase_pass_scores_full_weight_not_zero(self) -> None:
+        """The exact regression: "PASS" must score its weight, not 0.0."""
+        table = _gate_scores(_gates("PASS"))
+        for name in _GATE_NAMES:
+            assert table[name]["weighted_score"] == pytest.approx(
+                FIX_CONFIG.weights[name], abs=1e-4
+            )
 
-    def test_single_gate_list(self) -> None:
-        result = _normalize_input([_GATE])
-        assert result[0]["gates"] == [_GATE]
+    def test_uppercase_pass_table_total_matches_engine_raw_score(self) -> None:
+        """Table total and engine verdict are derived consistently, not independently."""
+        gates = _gates("PASS")
+        total = sum(float(entry["weighted_score"]) for entry in _gate_scores(gates).values())
+        score = score_fix(gates)
+        assert score.fix_status == FixVerdict.FIXED
+        assert total == pytest.approx(score.raw_score, abs=1e-3)
 
-    def test_raises_on_unknown_shape(self) -> None:
-        with pytest.raises(ValueError, match="Unrecognized"):
-            _normalize_input({"foo": "bar"})
+    def test_case_variants_produce_identical_tables(self) -> None:
+        baseline = _gate_scores(_gates("pass"))
+        for variant in ("PASS", "Pass", "pAsS", " pass "):
+            assert _gate_scores(_gates(variant)) == baseline
 
-    def test_raises_on_scalar(self) -> None:
-        with pytest.raises(ValueError):
-            _normalize_input("not valid")  # type: ignore[arg-type]
+    def test_lowercase_pass_scores_full_weight(self) -> None:
+        table = _gate_scores(_gates("pass"))
+        assert table["root_cause"]["weighted_score"] == pytest.approx(0.43, abs=1e-4)
+
+    def test_uppercase_partial_scores_half_weight(self) -> None:
+        table = _gate_scores(_gates("PARTIAL"))
+        assert table["root_cause"]["weighted_score"] == pytest.approx(0.43 * 0.5, abs=1e-4)
+
+    def test_uppercase_fail_scores_zero(self) -> None:
+        table = _gate_scores(_gates("FAIL"))
+        assert all(entry["weighted_score"] == 0.0 for entry in table.values())
+
+    def test_uppercase_skip_scores_zero(self) -> None:
+        table = _gate_scores(_gates("SKIP"))
+        assert all(entry["weighted_score"] == 0.0 for entry in table.values())
+
+    def test_status_is_published_canonicalised(self) -> None:
+        """The table reports the canonical status it actually scored, not the raw input."""
+        table = _gate_scores(_gates("PASS"))
+        assert {entry["status"] for entry in table.values()} == {GateStatus.PASS.value}
+
+    def test_out_of_vocab_status_scores_zero_as_invalid(self) -> None:
+        table = _gate_scores(_gates("definitely-not-a-status"))
+        assert table["root_cause"]["status"] == GateStatus.INVALID.value
+        assert table["root_cause"]["weighted_score"] == 0.0
+
+    def test_unknown_gate_name_carries_zero_weight(self) -> None:
+        table = _gate_scores(_gates("PASS", ("not_a_real_gate",)))
+        assert table["not_a_real_gate"]["weight"] == 0.0
+        assert table["not_a_real_gate"]["weighted_score"] == 0.0
+
+
+def test_merge_readiness_is_derivable_for_a_passing_score() -> None:
+    """Guards the one scoring/__main__.py behaviour with a production caller."""
+    assert derive_merge_readiness(score_fix(_gates("PASS"))) is not None

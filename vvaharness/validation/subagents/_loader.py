@@ -21,7 +21,8 @@ from dataclasses import replace
 from importlib.resources import files
 from pathlib import Path
 
-from vvaharness.validation.backends.contract.subagents import SubagentDefinition
+from vvaharness.backends.harness.contract.subagents import SubagentDefinition
+from vvaharness.validation.models.persona_report import PersonaReport
 from vvaharness.validation.subagents._frontmatter import (
     SubagentFrontmatterMeta,
     parse_frontmatter,
@@ -61,6 +62,8 @@ def _build_subagent_definition(
         ),
         model=model if isinstance(model, str) else None,
         skills=tuple(skills_raw) if isinstance(skills_raw, list) and skills_raw else None,
+        # Every validation persona returns a structured PersonaReport.
+        response_model=PersonaReport,
     )
 
 
@@ -76,6 +79,7 @@ def load_agents(
     names: Iterable[str] | None = None,
     model_overrides: dict[str, str] | None = None,
     tools_override: tuple[str, ...] | None = None,
+    prompt_suffix: str | None = None,
 ) -> dict[str, SubagentDefinition]:
     """Load subagent definitions from bundled .md files, filtered to names if given.
 
@@ -85,6 +89,10 @@ def load_agents(
 
     ``tools_override`` (when given) replaces every persona's tool allow-list; ``None`` keeps
     the frontmatter ``allowedTools``.
+
+    ``prompt_suffix`` (when given) is appended to every persona's prompt. Backends that
+    receive the injected ``.claude/`` directory auto-load the rules and pass ``None``; the
+    rest use this to deliver the same rules inline.
     """
     wanted: set[str] | None = set(names) if names is not None else None
     overrides = model_overrides or {}
@@ -99,6 +107,10 @@ def load_agents(
             subagent = replace(subagent, model=overrides[subagent.name])
         if tools_override is not None:
             subagent = replace(subagent, tools=tools_override)
+        if prompt_suffix:
+            subagent = replace(
+                subagent, prompt=f"{subagent.prompt.rstrip()}\n\n{prompt_suffix}"
+            )
         result[subagent.name] = subagent
     _assert_all_found(wanted, set(result.keys()))
     return result

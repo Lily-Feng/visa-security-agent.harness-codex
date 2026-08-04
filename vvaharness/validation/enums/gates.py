@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from vvaharness.validation.enums._compat import StrEnum
+from enum import StrEnum
 
 __all__ = ["GateName", "GateStatus"]
 
@@ -40,6 +40,17 @@ class GateStatus(StrEnum):
             return cls(value.strip().lower())
         except ValueError:
             return cls.INVALID
+
+
+# Most-severe-first ordering used by deterministic persona synthesis when personas
+# disagree. Fail is most conservative; invalid is a last-resort fallback.
+_STATUS_CONSERVATIVE_RANK = (
+    GateStatus.FAIL,
+    GateStatus.PARTIAL,
+    GateStatus.PASS,
+    GateStatus.SKIP,
+    GateStatus.INVALID,
+)
 
 
 class GateName(StrEnum):

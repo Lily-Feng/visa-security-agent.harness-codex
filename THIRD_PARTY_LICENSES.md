@@ -21,12 +21,12 @@ at install time (`pipx install .` / `pip install .`) and are **not** vendored
 or redistributed as part of this repository. This inventory is provided for
 transparency and compliance review.
 
-**Source:** CycloneDX SBOM from composition-analysis
-scan dated 2026-06-26 (639 components in the full closure). The table below lists the project's
-direct runtime dependencies with the version constraints declared in
-`pyproject.toml` and the licenses reported by the scan. Transitive packages are
-resolved and installed from PyPI at install time (not vendored); the SBOM is the
-system of record for the full transitive closure.
+**Source:** = SPDX exports of this scan
+is dated 2026-08-03. The table below lists
+the project's direct runtime dependencies with the version constraints
+declared in `pyproject.toml` and the licenses reported by the scan. Transitive
+packages are resolved and installed from PyPI at install time (not vendored);
+the SBOM is the system of record for the full transitive closure.
 
 ### Direct runtime dependencies
 
@@ -42,11 +42,19 @@ system of record for the full transitive closure.
 | python-dotenv | >=1.2.2 | BSD-3-Clause |
 | typing_extensions | >=4.0 | PSF-2.0 |
 | claude-agent-sdk | >=0.2.87 | MIT |
+| deepagents | >=0.6.8,<0.7 | MIT |
+| langchain | >=0.3.0 | MIT |
+| langchain-anthropic | >=0.3.0 | MIT |
+| langchain-openai | >=0.3.0 | MIT |
+| langgraph | >=0.3.0 | MIT |
+| tree-sitter | >=0.26.0,<0.27 | MIT |
+| tree-sitter-language-pack | >=1.14.0,<2 | MIT |
 
 Transitive dependencies pulled in from PyPI (e.g. `anyio`, `annotated-types`,
 `h11`, `httpcore`, `idna`, `sniffio`, `distro`, `jiter`, `pydantic-core`,
-`packaging`) are permissive — MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, or
-PSF-2.0 — except `certifi` and `tqdm`, which are MPL-2.0 (weak-copyleft at the
-file level). The SBOM closure contains **no** reciprocal or strong-copyleft
-licenses (no GPL / LGPL / AGPL / EPL), so nothing imposes copyleft obligations on
-first-party source and all are compatible with an Apache-2.0 outbound license.
+`packaging`) are permissive — MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause,
+CNRI-Python, MIT-0, or PSF-2.0 — except `certifi` and `tqdm`, which are
+MPL-2.0 (weak-copyleft at the file level). The SBOM closure contains **no**
+reciprocal or strong-copyleft licenses (no GPL / LGPL / AGPL / EPL), so nothing
+imposes copyleft obligations on first-party source and all are compatible with
+an Apache-2.0 outbound license.

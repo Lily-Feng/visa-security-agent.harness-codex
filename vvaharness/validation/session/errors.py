@@ -14,7 +14,7 @@
 
 """Domain exception hierarchy for harness-backed validation sessions."""
 
-from vvaharness.validation.backends.contract.errors import HarnessError, HarnessProcessError
+from vvaharness.backends.harness.contract.errors import HarnessError, HarnessProcessError
 from vvaharness.validation.constants.artifacts import STDERR_TAIL_LINES
 
 

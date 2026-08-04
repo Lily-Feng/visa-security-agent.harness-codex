@@ -18,10 +18,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vvaharness"
-version = "1.1.0"
+version = "1.2.0"
 description = "Visa's open-source harness for autonomous vulnerability discovery and validation, using frontier AI models"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 dependencies = [
     "pydantic>=2.13.4",
@@ -34,6 +34,15 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "typing_extensions>=4.0",
     "claude-agent-sdk>=0.2.87",
+    "tree-sitter>=0.26.0,<0.27",
+    "tree-sitter-language-pack>=1.14.0,<2",
+    # Keep the marker aligned with DeepAgents' own floor. The project-level
+    # requires-python >=3.11 means supported installs always include it.
+    "deepagents>=0.6.8,<0.7; python_version >= '3.11'",
+    "langchain>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-openai>=0.3.0",
+    "langgraph>=0.3.0",
 ]
 
 [project.optional-dependencies]
@@ -50,17 +59,39 @@ include = ["vvaharness*"]
 [tool.setuptools.package-data]
 vvaharness = [
     "config/profiles/*.yaml",
+    # Explicit allowlist — do NOT use a broad rules/*.yaml glob. Org-specific
+    # overlays (e.g. *.kb.yaml harvested from internal reviews) must live
+    # OUTSIDE the package and be referenced by path, never packaged. See
+    # vvaharness/rules/__init__.py and rules/README.md.
+    "rules/sources.generated.yaml",
+    "rules/sinks.generated.yaml",
+    "rules/generic.kb.yaml",
+    "rules/README.md",
     "validation/hints/*.yaml",
     "validation/prompts/*.md",
     "validation/subagents/*.md",
     "validation/claude_config/**/*",
 ]
 
+# These files intentionally remain canonical under the repository-level
+# ``inputs/`` directory. Install them into a stable shared-data location so a
+# non-editable wheel does not lose the fail-closed remediation rules.
+[tool.setuptools.data-files]
+"share/vvaharness/rules" = [
+    "inputs/remediation_policy.yaml",
+    "inputs/remediation_playbook.yaml",
+]
+
+# vvaharness ships production modules named test_*.py (fact tools the agent calls);
+# without this pytest scrapes them from the repo root and errors on them.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 # Strict typing gate, scoped to the new validation package only. The
 # surrounding harness predates this standard and is excluded.
 [tool.pyright]
 include = ["vvaharness/validation"]
-pythonVersion = "3.10"
+pythonVersion = "3.11"
 typeCheckingMode = "standard"
 reportMissingImports = true
 reportMissingTypeStubs = false

@@ -24,7 +24,7 @@ from pydantic import ValidationError
 
 from vvaharness.config import is_network_path
 from vvaharness.orchestrator import _default_config
-from vvaharness.validation.cli._model import _apply_model_env
+from vvaharness.validation.cli._model import _apply_model_env, _check_persona_vendors
 from vvaharness.validation.cli._parser import _build_parser
 from vvaharness.validation.cli._run import Selection, run_validation
 from vvaharness.validation.config import load_config
@@ -115,10 +115,15 @@ def _dispatch(argv: list[str] | None) -> int:
     rc, overrides = _apply_model_env(_resolve_config_path(args))
     if rc != 0:
         return rc
+    # Both refusals run before load_config, so nothing is staged and nothing spent.
+    # The backend itself needs no gate: _apply_model_env has already routed legacy
+    # `via: openai` to DeepAgents, and any other unknown value is reported by the
+    # config layer, which has the field context this boundary lacks.
+    for code, err in ((2, _check_persona_vendors(overrides)), (1, _check_path_guards(args))):
+        if err:
+            print(err, file=sys.stderr)
+            return code
     config = load_config(overrides=overrides)
-    if err := _check_path_guards(args):
-        print(err, file=sys.stderr)
-        return 1
     # Resolve to absolute (after the UNC guard) so subprocess cwd, the Write gate, and
     # the report reader agree on one path regardless of the launch directory.
     repo: Path = args.repo.resolve()

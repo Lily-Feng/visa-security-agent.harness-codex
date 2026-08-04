@@ -14,8 +14,8 @@
 
 """Write the agentic verdict back into the remediation DTO's validation block.
 
-The validator's authoritative output is the per-finding ``validation_report.json``
-the agent writes into the staged workspace. This module folds that verdict back
+The host persists each session's structured narrative to the per-finding
+``validation_report.json`` in the staged workspace. This module folds it back
 into the canonical ``remediate_report.json`` sidecar — filling the ``validation``
 block (the shape laid out by ``remediation_agent.artifacts.empty_validation``) and
 advancing ``status`` — so the DTO carries its own outcome. The terminal status is
@@ -126,11 +126,18 @@ def _dump_raw_dto(path: Path, dto: dict[str, object]) -> bool:
     return True
 
 
-def write_back_validation(report: RemediationReport, workspace: Path) -> str | None:
+def write_back_validation(
+    report: RemediationReport, workspace: Path, *, session_failed: bool = False
+) -> str | None:
     """Fold the workspace verdict into the DTO's validation block + status.
 
     Returns the written status, or None if there is no source path to write to or
     the DTO file could not be read/written.
+
+    *session_failed* marks a hard session/agent failure. It discards the host score so the
+    already fail-closed ``effective_score`` path records UNVERIFIABLE → ``needs_review``,
+    even if a partial ``synthesized_gates.json`` survived in the workspace. Defence in
+    depth: the launcher no longer writes artifacts for a failed session.
     """
     dto_path: Path | None = report.source_path
     if dto_path is None:
@@ -139,7 +146,10 @@ def write_back_validation(report: RemediationReport, workspace: Path) -> str | N
     if dto is None:
         return None
     verdict: FixFindingReport = _load_verdict(workspace, report.finding_id)
-    host = effective_score(host_score_for(report.finding_id, load_synthesized_gates(workspace)))
+    host = effective_score(
+        None if session_failed
+        else host_score_for(report.finding_id, load_synthesized_gates(workspace))
+    )
     status: str = _terminal_status(host.fix_status)
     dto["validation"] = _validation_block(verdict, host)
     dto["status"] = status

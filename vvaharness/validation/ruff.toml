@@ -14,7 +14,7 @@
 
 # Strict lint/format standard for the validation package.
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [lint]
 select = [
@@ -33,9 +33,15 @@ extend-select = ["TRY201", "TRY300", "TRY301", "TRY400", "SIM910"]
 
 [lint.per-file-ignores]
 "scoring/*" = ["S", "S603", "S607"]    # scoring spawns subprocesses legitimately
-"scoring/__main__.py" = ["S", "S603", "S607", "PLR2004"]
 "__init__.py" = ["D104", "F401"]       # re-export modules
-"enums/_compat.py" = ["UP042"]         # StrEnum shim must subclass (str, Enum) for py3.10
+# The @tool function names ARE the LLM-facing tool contract: `_fact_tools` matches them
+# against the `allowed` name set and the agent calls them by that exact name. PascalCase
+# is required, so N802 (lowercase function name) cannot apply here.
+"**/tools/deep_tools.py" = ["N802"]
+# A005 fires only when ruff runs from inside this package, where it infers the module as
+# top-level `io`. It is always imported as `vvaharness.validation.io`, so nothing shadows
+# stdlib `io`; the package itself never imports stdlib `io` either.
+"io/__init__.py" = ["A005", "D104", "F401"]
 "**/test_*.py" = ["S101", "ANN", "D", "PLR2004"]
 "tests/*.py" = ["S101", "ANN", "D", "PLR2004"]
 

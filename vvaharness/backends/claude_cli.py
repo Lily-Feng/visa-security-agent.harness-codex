@@ -708,6 +708,26 @@ _RL_BACKOFF = (30, 60, 120, 240)
 # been a genuine transient hang); bounded to cap the added wall-clock.
 _TIMEOUT_MAX_RETRIES = 1
 
+# Claude Code may return a placeholder while background sub-agents are still
+# executing. Treat these as incomplete output and retry boundedly rather than
+# letting callers parse partial/non-JSON text as an empty map.
+_PENDING_RESULT_RX = re.compile(
+    r"__PENDING__"
+    r"|still executing"
+    r"|(?:task\s+is\s+)?still\s+pending"
+    r"|waiting\s+for\s+(?:background\s+)?sub-?agent"
+    r"|background\s+sub-?agent",
+    re.IGNORECASE,
+)
+_PENDING_MAX_RETRIES = 3
+_PENDING_BACKOFF = (5, 15, 30)
+
+
+def _is_pending_result(text: str | None) -> bool:
+    if not isinstance(text, str):
+        return False
+    return bool(_PENDING_RESULT_RX.search(text))
+
 
 def _terminal_result_fields(stdout: str | None
                             ) -> tuple[int | None, str | None, bool]:
@@ -956,32 +976,59 @@ def agentic(
     # When streaming the live trace, the per-line callback already shows
     # progress, so the periodic heartbeat is suppressed (the streaming runner
     # ignores it anyway).
-    result = _run_with_retry(
-        cmd,
-        label=f"agentic({model}){tag_sfx}",
-        input=user_prompt,
-        cwd=cwd,
-        timeout=3600,
-        heartbeat_label=(None if stream_cb
-                         else f"agentic mode ({model}){tag_sfx}"),
-        stream_cb=stream_cb,
-    )
+    pending_attempt = 0
+    while True:
+        result = _run_with_retry(
+            cmd,
+            label=f"agentic({model}){tag_sfx}",
+            input=user_prompt,
+            cwd=cwd,
+            timeout=3600,
+            heartbeat_label=(None if stream_cb
+                             else f"agentic mode ({model}){tag_sfx}"),
+            stream_cb=stream_cb,
+        )
 
-    if result.returncode != 0:
-        raise RuntimeError(_format_cli_error("claude CLI agentic failed", cmd, result))
+        if result.returncode != 0:
+            raise RuntimeError(_format_cli_error("claude CLI agentic failed", cmd, result))
 
-    text, usage = _parse_envelope(result.stdout)
-    TOKENS.add(usage)
-    if usage:
-        _in = (int(usage.get('input_tokens', 0) or 0)
-               + int(usage.get('cache_creation_input_tokens', 0) or 0)
-               + int(usage.get('cache_read_input_tokens', 0) or 0))
-        _cache_r = int(usage.get('cache_read_input_tokens', 0) or 0)
-        _cache_w = int(usage.get('cache_creation_input_tokens', 0) or 0)
-        _out = int(usage.get('output_tokens', 0) or 0)
-        cache_info = f" (cache_read={_cache_r}, cache_write={_cache_w})" if (_cache_r or _cache_w) else ""
-        print(f"    [cli] usage: in={_in}{cache_info} out={_out}", file=sys.stderr)
-    return text
+        text, usage = _parse_envelope(result.stdout)
+        TOKENS.add(usage)
+        if usage:
+            _in = (int(usage.get('input_tokens', 0) or 0)
+                   + int(usage.get('cache_creation_input_tokens', 0) or 0)
+                   + int(usage.get('cache_read_input_tokens', 0) or 0))
+            _cache_r = int(usage.get('cache_read_input_tokens', 0) or 0)
+            _cache_w = int(usage.get('cache_creation_input_tokens', 0) or 0)
+            _out = int(usage.get('output_tokens', 0) or 0)
+            cache_info = f" (cache_read={_cache_r}, cache_write={_cache_w})" if (_cache_r or _cache_w) else ""
+            print(f"    [cli] usage: in={_in}{cache_info} out={_out}", file=sys.stderr)
+
+        if not _is_pending_result(text):
+            return text
+
+        pending_attempt += 1
+        snippet = redact((text or "").strip().replace("\n", " "))[:200]
+        if pending_attempt > _PENDING_MAX_RETRIES:
+            raise RuntimeError(
+                "claude CLI agentic returned an unfinished background-subagent "
+                f"state after {_PENDING_MAX_RETRIES} retries; refusing to "
+                f"continue with partial output. last_result={snippet!r}"
+            )
+        wait = _PENDING_BACKOFF[min(pending_attempt - 1,
+                                    len(_PENDING_BACKOFF) - 1)]
+        print(
+            f"    [cli] agentic returned pending output; retrying in {wait}s "
+            f"({pending_attempt}/{_PENDING_MAX_RETRIES})",
+            file=sys.stderr,
+        )
+        slept = 0
+        while slept < wait:
+            if _ABORT.is_set():
+                raise RuntimeError("aborted by user (Ctrl-C)")
+            step = min(5, wait - slept)
+            time.sleep(step)
+            slept += step
 
 
 def parse_json_response(text: str) -> dict | list:

@@ -27,7 +27,7 @@ from vvaharness.validation.constants.artifacts import (
     VALIDATION_REPORT_FILENAME,
 )
 from vvaharness.validation.constants.paths import ValidationPath
-from vvaharness.validation.constants.verdicts import Answer, FixVerdict
+from vvaharness.validation.enums.verdicts import Answer, FixVerdict
 from vvaharness.validation.io._host_score import (
     HostScore,
     effective_score,
@@ -106,7 +106,7 @@ def collect_results(
     """Parse validation_report.json into per-finding ValidationResults.
 
     The verdict (fix_status / raw_score / merge_readiness) is recomputed host-side from the
-    agent-written synthesized_gates.json via the deterministic scoring engine; when those
+    host-persisted synthesized_gates.json via the deterministic scoring engine; when those
     gates are unavailable the verdict fails closed to UNVERIFIABLE, never the agent's
     self-reported number.
     """

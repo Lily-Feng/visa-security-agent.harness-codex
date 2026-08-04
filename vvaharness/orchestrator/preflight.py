@@ -15,15 +15,19 @@
 
 from __future__ import annotations
 
+import asyncio
+
 """orchestrator.preflight — see package docstring."""
 import os
 import shutil
 import sys
 import tempfile
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from vvaharness.backends import sdk, oai, claude_cli as cli
-from vvaharness.backends.llm import resolve as resolve_model
+from vvaharness.backends.llm import (DEEPAGENTS_ROLES, POST_SCAN_ROLES,
+                                     resolve as resolve_model)
 from vvaharness.orchestrator.config_paths import _iter_model_roles, _resolve_against
 
 
@@ -104,13 +108,46 @@ def _reachable_despite_token_cap(err_msg: str) -> bool:
     return "exceeded" in low and "output token" in low
 
 
+def _post_scan_only(roles: Iterable[str]) -> bool:
+    """True when every role in *roles* runs after detection (S10/S11).
+
+    Empty is False: an unattributed gap is never assumed harmless.
+    """
+    return bool(roles) and set(roles) <= POST_SCAN_ROLES
+
+
+def _report_credential_gap(message: str, roles: Iterable[str], *remedies: str) -> bool:
+    """Print a credential gap; return True when it must abort the run.
+
+    A gap that only affects post-scan roles is a WARN: S1-S9 detection needs nothing
+    from that credential, and the S10/S11 gates in orchestrator.scan disable the
+    affected stage on their own. A credential shared with ANY detection role stays
+    fatal exactly as before - a scan that cannot detect must not start.
+    """
+    if _post_scan_only(roles):
+        print(f"  WARN: {message}", file=sys.stderr)
+        print(f"    required only by {', '.join(sorted(roles))} — that stage "
+              f"will be skipped", file=sys.stderr)
+        return False
+    print(f"ERROR: {message}", file=sys.stderr)
+    for line in remedies:
+        print(f"  {line}", file=sys.stderr)
+    return True
+
+
 def check_backends(cfg) -> bool:
     """
     Verify whichever backend(s) the config actually uses:
       - any role with via:cli  → `claude` must be on PATH
       - any role with via:sdk  → ANTHROPIC_SDK_API_KEY (or cfg.sdk.api_key) must be set
     """
-    vias = {resolve_model(m)[1] for _, m in _iter_model_roles(cfg)}
+    model_roles = list(_iter_model_roles(cfg))
+    vias = {resolve_model(m)[1] for _, m in model_roles}
+    # Which roles depend on each backend — decides whether a gap is fatal (any
+    # detection role) or a skip-this-stage WARN (post-scan roles only).
+    roles_by_via: dict[str, set[str]] = {}
+    for _role, _model in model_roles:
+        roles_by_via.setdefault(resolve_model(_model)[1], set()).add(_role)
 
     print(f"  [auth] active backends: {', '.join(sorted(vias)) or '(none)'}",
           file=sys.stderr)
@@ -156,13 +193,24 @@ def check_backends(cfg) -> bool:
             print(f"    {label}= {shown}", file=sys.stderr)
 
     ok = True
+    invalid_deepagents = sorted(
+        role for role, model in model_roles
+        if resolve_model(model)[1] == "deepagents" and role not in DEEPAGENTS_ROLES
+    )
+    if invalid_deepagents:
+        print(
+            "ERROR: via:deepagents is supported only for models.remediate and "
+            f"models.validate; invalid role(s): {', '.join(invalid_deepagents)}",
+            file=sys.stderr,
+        )
+        ok = False
     if "cli" in vias:
         if not (shutil.which("claude") or shutil.which("claude.cmd")):
-            print("ERROR: `claude` CLI not found on PATH (required by via:cli roles).",
-                  file=sys.stderr)
-            print("  Install: https://docs.anthropic.com/en/docs/claude-code",
-                  file=sys.stderr)
-            ok = False
+            if _report_credential_gap(
+                    "`claude` CLI not found on PATH (required by via:cli roles).",
+                    roles_by_via["cli"],
+                    "Install: https://docs.anthropic.com/en/docs/claude-code"):
+                ok = False
         else:
             print("  [cli] claude found on PATH ✓", file=sys.stderr)
 
@@ -180,13 +228,14 @@ def check_backends(cfg) -> bool:
                   or os.environ.get("ANTHROPIC_AUTH_TOKEN")
             used_fallback = bool(key)
         if not key:
-            print("ERROR: ANTHROPIC_SDK_API_KEY not set (required by via:sdk roles).",
-                  file=sys.stderr)
-            print("  export ANTHROPIC_SDK_API_KEY=sk-ant-...", file=sys.stderr)
+            remedies = ["export ANTHROPIC_SDK_API_KEY=sk-ant-..."]
             if sdk_sole:
-                print("  (or set ANTHROPIC_API_KEY — accepted as a fallback "
-                      "because sdk is the only backend)", file=sys.stderr)
-            ok = False
+                remedies.append("(or set ANTHROPIC_API_KEY — accepted as a fallback "
+                                "because sdk is the only backend)")
+            if _report_credential_gap(
+                    "ANTHROPIC_SDK_API_KEY not set (required by via:sdk roles).",
+                    roles_by_via["sdk"], *remedies):
+                ok = False
         elif used_fallback:
             print("  [sdk] ANTHROPIC_SDK_API_KEY unset — using "
                   "ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN fallback "
@@ -198,12 +247,33 @@ def check_backends(cfg) -> bool:
         key = getattr(getattr(cfg, "openai", None), "api_key", None) \
               or os.environ.get("OPENAI_API_KEY")
         if not key:
-            print("ERROR: OPENAI_API_KEY not set (required by via:openai roles).",
-                  file=sys.stderr)
-            print("  export OPENAI_API_KEY=sk-...", file=sys.stderr)
-            ok = False
+            if _report_credential_gap(
+                    "OPENAI_API_KEY not set (required by via:openai roles).",
+                    roles_by_via["openai"], "export OPENAI_API_KEY=sk-..."):
+                ok = False
         else:
             print("  [openai] OPENAI_API_KEY present ✓", file=sys.stderr)
+
+    if "deepagents" in vias:
+        from vvaharness.util.environment import _backend_credential_ok
+
+        # Credentials are per (model_id, provider) target, not per via, so the
+        # fatal/WARN decision needs the roles behind each individual target.
+        deep_specs: dict[tuple[str, str | None], set[str]] = {}
+        for role, model in model_roles:
+            if resolve_model(model)[1] != "deepagents":
+                continue
+            spec = (resolve_model(model)[0], getattr(model, "provider", None))
+            deep_specs.setdefault(spec, set()).add(role)
+        # Sort on a total order: provider is None for name-inferred targets, which
+        # would make a bare tuple comparison against a str provider raise.
+        for (model_id, provider), roles in sorted(
+                deep_specs.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
+            ready, detail = _backend_credential_ok("deepagents", model_id, provider)
+            if ready:
+                print(f"  [deepagents] {model_id}: {detail} ✓", file=sys.stderr)
+            elif _report_credential_gap(f"DeepAgents {model_id}: {detail}", roles):
+                ok = False
 
     # ── Live connectivity probe ─────────────────────────────────────────
     # Skipped when credential checks already failed (nothing to probe).
@@ -314,6 +384,17 @@ def probe_backends(cfg) -> bool:
     so both exercise the same path the real scan will use. The prompt ping is
     followed by a bounded agentic smoke probe for the agentic-only roles."""
     from vvaharness.backends.llm import prompt as _probe
+    invalid_deepagents = sorted(
+        role for role, model in _iter_model_roles(cfg)
+        if resolve_model(model)[1] == "deepagents" and role not in DEEPAGENTS_ROLES
+    )
+    if invalid_deepagents:
+        print(
+            "ERROR: refusing DeepAgents probe for unsupported role(s): "
+            + ", ".join(invalid_deepagents),
+            file=sys.stderr,
+        )
+        return False
     # (model_id, via) -> (model_cfg_node, [roles]) — keep the original cfg
     # node so llm.resolve() (which reads .id/.via via getattr) works.
     targets: dict[tuple[str, str], tuple[object, list[str]]] = {}
@@ -325,12 +406,33 @@ def probe_backends(cfg) -> bool:
     print(f"  [probe] live model connectivity ({len(targets)} unique "
           f"model/backend pair(s)):", file=sys.stderr)
     ok = True
+    # Post-scan roles whose model is unreachable. Tracked so the closing summary
+    # cannot claim "all reachable" right after WARNing that one was not.
+    skipped: set[str] = set()
     for (mid, via), (mcfg, roles) in targets.items():
         role_list = ",".join(roles)
         t0 = time.time()
         try:
-            _probe("ping", model=mcfg,
-                   max_tokens=4, timeout=120, tag="preflight")
+            if via == "deepagents":
+                from vvaharness.backends.harness import OneShotOptions, get_harness
+
+                with tempfile.TemporaryDirectory(
+                        prefix="vva-preflight-deepagents-") as workdir:
+                    result = asyncio.run(get_harness(via).run_oneshot(
+                        "reply with the single word ok",
+                        OneShotOptions(
+                            model=mid,
+                            cwd=Path(workdir),
+                            env=dict(os.environ),
+                            max_turns=2,
+                        ),
+                    ))
+                if result.is_error:
+                    raise RuntimeError(
+                        f"DeepAgents preflight failed: {result.subtype or 'unknown error'}")
+            else:
+                _probe("ping", model=mcfg,
+                       max_tokens=4, timeout=120, tag="preflight")
             print(f"    ✓ [{via:<6}] {mid:<32} ({time.time()-t0:4.1f}s)  "
                   f"roles: {role_list}", file=sys.stderr)
         except Exception as e:
@@ -344,6 +446,14 @@ def probe_backends(cfg) -> bool:
             # index to avoid an IndexError masking the real probe failure.
             lines = str(e).splitlines()
             msg = (lines[0][:160] if lines else "") or "(no message)"
+            # A model only S10/S11 use being unreachable degrades that stage, not the
+            # scan: detection never touches it and the S10/S11 gates skip it.
+            if _post_scan_only(roles):
+                print(f"    WARN [{via:<6}] {mid:<32} unreachable  roles: "
+                      f"{role_list} — that stage will be skipped", file=sys.stderr)
+                print(f"      {type(e).__name__}: {msg}", file=sys.stderr)
+                skipped.update(roles)
+                continue
             print(f"    ✗ [{via:<6}] {mid:<32} FAILED  roles: {role_list}",
                   file=sys.stderr)
             print(f"      {type(e).__name__}: {msg}", file=sys.stderr)
@@ -354,7 +464,11 @@ def probe_backends(cfg) -> bool:
     # diagnostics in one pass.
     ok = _probe_agentic_roles(cfg) and ok
 
-    if ok:
+    if ok and skipped:
+        print(f"  [probe] detection backends reachable ✓ — "
+              f"{', '.join(sorted(skipped))} unreachable, so that stage is "
+              f"skipped (see WARN above)", file=sys.stderr)
+    elif ok:
         print("  [probe] all model backends reachable ✓", file=sys.stderr)
     else:
         print("ERROR: one or more model backends unreachable — fix before "

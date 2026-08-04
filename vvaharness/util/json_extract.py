@@ -98,7 +98,7 @@ def extract_json(text: str) -> dict | list:
     # an agent that shows a code snippet in a fence then trails the real JSON —
     # is still recovered instead of dropped.
     candidates: list[str] = []
-    # HB-009: a literal ``` appearing INSIDE a JSON string value (e.g. a chain
+    # A literal ``` appearing INSIDE a JSON string value (e.g. a chain
     # narrative quoting a code block) makes the non-greedy _FENCE.findall()
     # terminate at that inner ``` and return a truncated, unbalanced body. When
     # the WHOLE trimmed response is one fenced block, an anchored fullmatch
@@ -111,7 +111,7 @@ def extract_json(text: str) -> dict | list:
     candidates += _FENCE.findall(text)
     candidates.append(text)
 
-    # Defence-in-depth for HB-009: if the response (past any opening fence)
+    # Defence-in-depth for the same failure: if the response (past any opening fence)
     # visibly starts with '{', a top-level *list* result is almost certainly a
     # sub-span like "[10]" that happened to balance inside a string literal.
     # Hold the first such list and keep scanning for a dict; only return the

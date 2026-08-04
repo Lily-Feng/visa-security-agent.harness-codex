@@ -41,6 +41,14 @@ _ALL_FAIL: list[Mapping[str, object]] = [
 ]
 
 
+_ALL_PASS: list[Mapping[str, object]] = [
+    {"gate_name": "root_cause", "status": "pass"},
+    {"gate_name": "instance_coverage", "status": "pass"},
+    {"gate_name": "no_new_vulnerabilities", "status": "pass"},
+    {"gate_name": "security_best_practices", "status": "pass"},
+]
+
+
 def _write_gates(ws: Path, tracking_id: str, gates: list[Mapping[str, object]]) -> None:
     (ws / SYNTHESIZED_GATES_FILENAME).write_text(
         json.dumps([{"tracking_id": tracking_id, "gates": gates}])
@@ -147,6 +155,35 @@ def test_write_back_absent_gates_fails_closed(tmp_path: Path) -> None:
 
     report = RemediationReport.from_file(dto_path)
     written = write_back_validation(report, ws)
+
+    assert written == STATUS_NEEDS_REVIEW
+    dto = json.loads(dto_path.read_text(encoding="utf-8"))
+    assert dto["status"] == STATUS_NEEDS_REVIEW
+    assert dto["validation"]["fix_status"] == "UNVERIFIABLE"
+    assert dto["validation"]["raw_score"] == 0.0
+    # Agent narrative is still preserved alongside the fail-closed numbers.
+    assert dto["validation"]["justification"] == "agent narrative"
+
+
+def test_write_back_session_failed_fails_closed_despite_passing_gates(tmp_path: Path) -> None:
+    # Gates are present and all passing -- without the guard this folds a terminal
+    # "validated" into the DTO for a session that actually failed, and validated is
+    # excluded from re-validation. session_failed discards the host score so the verdict
+    # fails closed to UNVERIFIABLE -> needs_review.
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    dto_path = _write_dto(tmp_path, "01_finding", "F-1", "awaiting_validation")
+    _write_report(ws, [{
+        "tracking_id": "F-1", "fix_status": "Fixed", "raw_score": 0.99,
+        "justification": "agent narrative",
+    }])
+    _write_gates(ws, "F-1", _ALL_PASS)
+
+    report = RemediationReport.from_file(dto_path)
+    # Same inputs without the flag are a clean pass -- the flag alone changes the outcome.
+    assert write_back_validation(report, ws) == STATUS_VALIDATED
+
+    written = write_back_validation(report, ws, session_failed=True)
 
     assert written == STATUS_NEEDS_REVIEW
     dto = json.loads(dto_path.read_text(encoding="utf-8"))

@@ -131,7 +131,9 @@ def test_md_gains_validation_section(tmp_path: Path) -> None:
     assert "### Validation" in md
     assert str(_FIX_CONFIDENCE) in md
     assert "**Status:** Fixed" in md
-    assert "root_cause" in md  # gate table rendered
+    # Gate table rendered. "_" is escaped as an emphasis metacharacter, so the raw source
+    # carries "root\_cause" -- which renders back as "root_cause".
+    assert r"root\_cause" in md
 
 
 def test_idempotent_no_duplicate_section(tmp_path: Path) -> None:
@@ -220,10 +222,58 @@ def test_md_escape_neutralizes_injection() -> None:
     assert "\x00" not in out                                  # control chars stripped
 
 
+def _every_occurrence_escaped(out: str, ch: str) -> bool:
+    """True if every ``ch`` in ``out`` sits behind an odd-length backslash run.
+
+    An odd run means the final backslash escapes ``ch``, so Markdown renders it as a
+    literal. An even run means the backslashes escape each other and ``ch`` is live
+    syntax -- which is exactly what a backslash-blind escaper produces.
+    """
+    for i, c in enumerate(out):
+        if c != ch:
+            continue
+        run = 0
+        j = i - 1
+        while j >= 0 and out[j] == "\\":
+            run += 1
+            j -= 1
+        if run % 2 == 0:
+            return False
+    return True
+
+
+def test_md_escape_neutralizes_preceding_backslash() -> None:
+    """A backslash in the untrusted text must not consume the escape that follows it."""
+    from vvaharness.validation.report.augment import _md_escape
+    link = _md_escape(r"X\[click](u)")
+    assert _every_occurrence_escaped(link, "[")   # no live link
+    assert _every_occurrence_escaped(link, "]")
+    code = _md_escape(r"X\`code`")
+    assert _every_occurrence_escaped(code, "`")   # no live code span
+
+
 def test_md_cell_escapes_pipe_and_bounds_length() -> None:
     from vvaharness.validation.report.augment import _md_cell
     assert "\\|" in _md_cell("a | b")        # table delimiter escaped
     assert len(_md_cell("x" * 500)) <= 200   # cell length bounded
+    # A supplied backslash must not defeat the delimiter escape.
+    assert _every_occurrence_escaped(_md_cell(r"a\|b"), "|")
+
+
+def test_md_cell_truncation_leaves_no_dangling_escape() -> None:
+    """Truncation must not cut a doubled backslash in half and escape the next cell's ``|``.
+
+    The leading "x" is load-bearing: it makes the 200-char cut land mid-pair. Escaping
+    yields "x" + 600 backslashes, so truncation leaves an odd run of 199 that the trim must
+    reduce to 198. Without the "x" the cut falls on an even boundary (200), the trim is a
+    no-op, and the assertion holds even against a build with no trim at all.
+    """
+    from vvaharness.validation.report.augment import _md_cell
+    out = _md_cell("x" + "\\" * 300)
+    assert len(out) <= 200
+    trailing = len(out) - len(out.rstrip("\\"))
+    assert trailing % 2 == 0    # no dangling escape to consume the next delimiter
+    assert trailing == 198      # the odd 199-run was trimmed, not left as-is
 
 
 def test_malicious_justification_renders_inert(tmp_path: Path) -> None:

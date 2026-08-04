@@ -19,12 +19,15 @@ checkpoint I/O. Every legitimate per-step payload must round-trip (no
 """
 from __future__ import annotations
 import json
+from pathlib import Path
 
 import pytest
 
 from vvaharness.orchestrator import checkpoints as ck
 from vvaharness.orchestrator import store
+from vvaharness.pipeline.stages.s0_seed import SeedPackage
 from vvaharness.models import (ContextPackage, ThreatModel, TaskManifest,
+                                EntryPoint, Sink,
                                 Finding, DroppedFinding, FinalReport,
                                 RankedFinding, Severity)
 
@@ -88,6 +91,50 @@ def test_checkpoint_roundtrips_legit_payloads(tmp_path, step, obj):
     got = ck.load_ckpt(tmp_path, RID, step)
     assert got is not None and type(got) is type(obj)
     assert got == obj
+
+
+def _populated_seed() -> SeedPackage:
+    """A SeedPackage with the call-graph / def-span maps filled and a Path
+    ``sarif_path`` — the structures that carry the s0 checkpoint's real
+    payload."""
+    return SeedPackage(
+        entry_points=[EntryPoint(file="ctrl.py", function="handle",
+                                 kind="network", reachable_from_unauth=True)],
+        unsafe_sinks=[Sink(file="dao.py", line=40, function="raw_query")],
+        taint_paths=[["ctrl.py:10", "dao.py:40"]],
+        rule_cwe={"py.sqli": ["CWE-89"]},
+        call_graph={"ctrl.py::handle": ["dao.py::raw_query"]},
+        call_graph_files={"handle": ["ctrl.py:10"],
+                          "raw_query": ["dao.py:40"]},
+        def_spans={"ctrl.py::handle": [10, 20],
+                   "dao.py::raw_query": [40, 45]},
+        sarif_path=Path("/out/seed.sarif"),
+        languages=["python"],
+        all_files=["ctrl.py", "dao.py"],
+    )
+
+
+def test_s0_seedpackage_roundtrips_populated(tmp_path):
+    """A *populated* SeedPackage must survive the s0 checkpoint round-trip so
+    ``--resume`` can skip Step 0. Every persisted map is keyed by a JSON
+    object key (a string); a non-JSON-native key (e.g. a ``dict`` keyed by a
+    tuple) would ``dump_json`` to a comma-joined string that ``validate_json``
+    cannot rebuild, so ``load_ckpt`` would return ``None`` and this test would
+    fail on the ``got is not None`` / ``got == seed`` assertions."""
+    seed = _populated_seed()
+    ck.save_ckpt(tmp_path, RID, "s0", seed)
+    # Stored payload is JSON, and every checkpointed dict uses string keys.
+    con = store.connect()
+    raw = con.execute("SELECT payload FROM checkpoints WHERE run_id=? "
+                      "AND step=?", (RID, "s0")).fetchone()[0]
+    con.close()
+    doc = json.loads(raw)
+    for field_name in ("call_graph", "call_graph_files", "def_spans",
+                       "rule_cwe"):
+        assert all(isinstance(k, str) for k in doc[field_name])
+    got = ck.load_ckpt(tmp_path, RID, "s0")
+    assert got is not None and type(got) is SeedPackage
+    assert got == seed
 
 
 def test_checkpoint_refuses_malformed_payload(capsys):
@@ -230,3 +277,105 @@ def test_prune_checkpoints_no_root(tmp_path, monkeypatch):
     monkeypatch.setenv("VVAHARNESS_STATE_DIR", str(tmp_path / "fresh"))
     r = ck.prune_checkpoints(keep_runs=100, max_age_days=5)
     assert r["kept"] == 0 and r["deleted"] == []
+
+
+def _ctx_with_graph() -> ContextPackage:
+    return ContextPackage(
+        repo_root="/r",
+        language="python",
+        all_files=["ctrl.py", "dao.py"],
+        entry_points=[EntryPoint(file="ctrl.py", function="handle",
+                                 kind="network", reachable_from_unauth=True)],
+        unsafe_sinks=[Sink(file="dao.py", line=40, function="raw_query")],
+        call_graph={"ctrl.py::handle": ["dao.py::raw_query"]},
+        call_graph_files={
+            "handle": ["ctrl.py:10"],
+            "raw_query": ["dao.py:40"],
+        },
+        def_spans={
+            "ctrl.py::handle": [10, 20],
+            "dao.py::raw_query": [40, 45],
+        },
+    )
+
+
+def test_save_callgraph_dedupes_snapshot_and_records_stage_refs():
+    ctx = _ctx_with_graph()
+    g1 = store.save_callgraph(RID, "s1", ctx)
+    g2 = store.save_callgraph(RID, "s2", ctx)
+    assert g1 and g1 == g2
+
+    con = store.connect()
+    snap = con.execute(
+        "SELECT node_count, edge_count, entry_point_count, sink_count "
+        "FROM callgraph_snapshots WHERE run_id=? AND graph_id=?",
+        (RID, g1),
+    ).fetchone()
+    refs = con.execute(
+        "SELECT step, graph_id FROM callgraph_stage_refs WHERE run_id=? "
+        "ORDER BY step",
+        (RID,),
+    ).fetchall()
+    nodes = con.execute(
+        "SELECT qnode, is_entry_point, entry_kind, reachable_from_unauth, "
+        "is_sink, sink_line FROM callgraph_nodes WHERE run_id=? ORDER BY qnode",
+        (RID,),
+    ).fetchall()
+    edges = con.execute(
+        "SELECT caller_qnode, callee_qnode FROM callgraph_edges WHERE run_id=?",
+        (RID,),
+    ).fetchall()
+    con.close()
+
+    assert snap == (2, 1, 1, 1)
+    assert refs == [("s1", g1), ("s2", g1)]
+    assert nodes == [
+        ("ctrl.py::handle", 1, "network", 1, 0, 0),
+        ("dao.py::raw_query", 0, "", 0, 1, 40),
+    ]
+    assert edges == [("ctrl.py::handle", "dao.py::raw_query")]
+
+
+def test_load_callgraph_roundtrip_from_stage_ref():
+    ctx = _ctx_with_graph()
+    store.save_callgraph(RID, "s1", ctx)
+
+    loaded = store.load_callgraph(RID, "s1")
+    assert loaded is not None
+    assert loaded["node_count"] == 2
+    assert loaded["edge_count"] == 1
+    assert loaded["call_graph"] == {"ctrl.py::handle": ["dao.py::raw_query"],
+                                    "dao.py::raw_query": []}
+    assert loaded["call_graph_files"] == {
+        "handle": ["ctrl.py:10"],
+        "raw_query": ["dao.py:40"],
+    }
+    assert loaded["def_spans"] == {
+        "ctrl.py::handle": [10, 20],
+        "dao.py::raw_query": [40, 45],
+    }
+
+
+def test_load_callgraph_missing_stage_ref_returns_none():
+    assert store.load_callgraph(RID, "s2") is None
+
+
+def test_reset_run_clears_callgraph_state_too():
+    ctx = _ctx_with_graph()
+    store.save_callgraph(RID, "s1", ctx)
+    ck.save_ckpt(None, RID, "s9", "/tmp/report.sarif")
+    cleared = store.reset_run(RID)
+    assert cleared == 2
+
+    con = store.connect()
+    counts = con.execute(
+        "SELECT "
+        " (SELECT COUNT(*) FROM checkpoints WHERE run_id=?),"
+        " (SELECT COUNT(*) FROM callgraph_snapshots WHERE run_id=?),"
+        " (SELECT COUNT(*) FROM callgraph_stage_refs WHERE run_id=?),"
+        " (SELECT COUNT(*) FROM callgraph_nodes WHERE run_id=?),"
+        " (SELECT COUNT(*) FROM callgraph_edges WHERE run_id=?)",
+        (RID, RID, RID, RID, RID),
+    ).fetchone()
+    con.close()
+    assert counts == (0, 0, 0, 0, 0)

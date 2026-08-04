@@ -2,11 +2,10 @@
   "model": "claude-opus-4-8[1m]",
   "permissions": {
     "allow": [
-      "Read", "Grep", "Glob",
-      "Write"
+      "Read", "Grep", "Glob"
     ],
     "deny": [
-      "Edit", "NotebookEdit",
+      "Write", "Edit", "NotebookEdit",
       "Bash"
     ]
   },

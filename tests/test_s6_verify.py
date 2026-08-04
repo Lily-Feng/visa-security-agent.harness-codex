@@ -217,6 +217,47 @@ def test_parse_verdict_accepts_30_vector():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# _build_user_prompt — callgraph-first context with explicit fallback guidance
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_build_user_prompt_includes_sqlite_callgraph_context():
+    f = _finding(
+        file="src/app.py",
+        line_start=10,
+        line_end=12,
+        source_ref="src/http.py:22",
+        sink_ref="src/app.py:11",
+    )
+    ctx = _ctx(
+        call_graph={
+            "src/http.py::handle": ["src/app.py::danger"],
+            "src/app.py::danger": ["src/db.py::exec"],
+        },
+        def_spans={
+            "src/app.py::danger": [8, 20],
+            "src/http.py::handle": [20, 35],
+        },
+        entry_points=[],
+    )
+
+    prompt = s6_verify._build_user_prompt(f, ctx)
+    assert "CALL GRAPH CONTEXT (sqlite-hydrated; validate each edge with Grep/Read):" in prompt
+    assert "candidate functions at/near finding line" in prompt
+    assert "src/app.py::danger" in prompt
+    assert "caller -> src/http.py::handle -> src/app.py::danger" in prompt
+    assert "callee -> src/app.py::danger -> src/db.py::exec" in prompt
+
+
+def test_build_user_prompt_includes_callgraph_fallback_when_candidates_missing():
+    f = _finding(file="src/app.py", line_start=10, line_end=12)
+    ctx = _ctx(call_graph={"src/a.py::x": ["src/b.py::y"]}, def_spans={})
+
+    prompt = s6_verify._build_user_prompt(f, ctx)
+    assert "candidate functions at finding location: (none)" in prompt
+    assert "action: use Grep on file/class symbols to recover callers/callees from code" in prompt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # run() — empty short-circuit
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -20,6 +20,7 @@ import pytest
 from vvaharness.util import environment as env
 from vvaharness.util.environment import OK, WARN, FAIL
 from vvaharness import cli
+from vvaharness.remediation_agent import rule_paths
 
 
 def _clear_anthropic(monkeypatch):
@@ -69,6 +70,26 @@ def test_required_deps_present():
     assert deps["dep: anthropic"].status == OK
 
 
+def test_dep_checks_warn_when_tree_sitter_missing(monkeypatch):
+    real_find_spec = env.importlib.util.find_spec
+
+    def fake_find_spec(name):
+        if name in {"tree_sitter", "tree_sitter_language_pack"}:
+            return None
+        return real_find_spec(name)
+
+    monkeypatch.setattr(env.importlib.util, "find_spec", fake_find_spec)
+    deps = {c.name: c for c in env.dep_checks()}
+
+    ts = deps["dep: tree-sitter"]
+    assert ts.status == WARN
+    assert "degraded taint coverage" in ts.detail
+
+    tsp = deps["dep: tree-sitter-language-pack"]
+    assert tsp.status == WARN
+    assert "AST plugins unavailable" in tsp.detail
+
+
 def test_python_check_ok_on_current_interpreter():
     assert env.python_check().status == OK
 
@@ -98,6 +119,37 @@ def test_summarize_counts():
               env.Check("d", FAIL, "", required=False)]
     n_ok, n_warn, n_block = env.summarize(checks)
     assert (n_ok, n_warn, n_block) == (1, 1, 1)
+
+
+def test_remediation_inputs_missing_is_blocking(monkeypatch, tmp_path):
+    monkeypatch.setattr(rule_paths, "candidate_inputs_dirs",
+                        lambda _package_file: (tmp_path,))
+    check = env.remediation_inputs_check()
+    assert check.status == FAIL
+    assert check.required is True
+    assert "interactive `vvaharness setup`" in check.detail
+
+
+def test_setup_prompt_persists_valid_inputs_dir(monkeypatch, tmp_path, capsys):
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    for name in rule_paths.RULE_FILES:
+        (inputs / name).write_text("schema_version: '1.0'\n", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    missing_dir = tmp_path / "missing"
+    monkeypatch.setenv("VVAHARNESS_SETTINGS_FILE", str(settings))
+
+    def candidates(_package_file):
+        configured = rule_paths.configured_inputs_dir()
+        return (missing_dir,) + ((configured,) if configured else ())
+    monkeypatch.setattr(rule_paths, "candidate_inputs_dirs", candidates)
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: str(inputs))
+
+    cli._prompt_for_remediation_inputs()
+
+    assert rule_paths.configured_inputs_dir() == inputs.resolve()
+    assert "saved remediation inputs directory" in capsys.readouterr().out
 
 
 # ── setup command end-to-end (rendering + exit code) ─────────────────────────
@@ -215,7 +267,7 @@ def test_remediate_validate_absent_when_flags_off(tmp_path):
     cfg.write_text(
         "models:\n  deepdive: {id: x, via: cli}\n"
         "  remediate: {id: x, via: cli}\n"
-        "  validate: {id: x, via: cli}\n",
+        "  validate:\n    orchestrator: {id: x, via: cli}\n",
         encoding="utf-8")
     checks = env.config_check(cfg)
     assert not _has(checks, "step10: remediate")
@@ -248,12 +300,53 @@ def test_remediate_flag_on_missing_cli_warns_not_blocking(monkeypatch, tmp_path)
     assert c.status == WARN and c.required is False
 
 
+def test_deepagents_remediation_requires_provider_credential(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cfg = tmp_path / "p.yaml"
+    cfg.write_text(
+        "models:\n  remediate: {id: gpt-5.5, via: deepagents, provider: openai}\n"
+        "step_remediate:\n  enabled: true\n",
+        encoding="utf-8")
+    checks = env.config_check(cfg)
+    c = next(c for c in checks if c.name == "step10: remediate")
+    assert c.status == WARN
+    assert "OPENAI_API_KEY" in c.detail
+
+
+def test_deepagents_remediation_accepts_openai_credential(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    cfg = tmp_path / "p.yaml"
+    cfg.write_text(
+        "models:\n  remediate: {id: gpt-5.5, via: deepagents}\n"
+        "step_remediate:\n  enabled: true\n",
+        encoding="utf-8")
+    checks = env.config_check(cfg)
+    c = next(c for c in checks if c.name == "step10: remediate")
+    assert c.status == OK
+    active = next(c for c in checks if c.name == "active backends")
+    assert "deepagents" in active.detail
+
+
+def test_deepagents_scan_role_is_invalid(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    cfg = tmp_path / "p.yaml"
+    cfg.write_text(
+        "models:\n  deepdive: {id: gpt-5.5, via: deepagents}\n",
+        encoding="utf-8",
+    )
+    checks = env.config_check(cfg)
+    invalid = next(c for c in checks if c.name == "via:deepagents roles")
+    assert invalid.status == FAIL
+    assert invalid.required is True
+    assert "deepdive" in invalid.detail
+
+
 def test_validate_flag_on_rejects_openai_backend(monkeypatch, tmp_path):
     monkeypatch.setattr(env.shutil, "which", lambda c: "/usr/bin/claude")
     cfg = tmp_path / "p.yaml"
     cfg.write_text(
         "models:\n  deepdive: {id: x, via: cli}\n"
-        "  validate: {id: x, via: openai}\n"
+        "  validate:\n    orchestrator: {id: x, via: openai}\n"
         "step_validate:\n  enabled: true\n",
         encoding="utf-8")
     checks = env.config_check(cfg)
@@ -268,7 +361,7 @@ def test_validate_flag_warns_when_sdk_missing(monkeypatch, tmp_path):
     cfg = tmp_path / "p.yaml"
     cfg.write_text(
         "models:\n  deepdive: {id: x, via: cli}\n"
-        "  validate: {id: x, via: cli}\n"
+        "  validate:\n    orchestrator: {id: x, via: cli}\n"
         "step_validate:\n  enabled: true\n",
         encoding="utf-8")
     checks = env.config_check(cfg)
@@ -284,7 +377,7 @@ def test_optin_step_issues_never_block_scan(monkeypatch, tmp_path):
     cfg = tmp_path / "p.yaml"
     cfg.write_text(
         "models:\n  deepdive: {id: x, via: cli}\n"
-        "  validate: {id: x, via: openai}\n"
+        "  validate:\n    orchestrator: {id: x, via: openai}\n"
         "step_remediate:\n  enabled: true\n"
         "step_validate:\n  enabled: true\n",
         encoding="utf-8")

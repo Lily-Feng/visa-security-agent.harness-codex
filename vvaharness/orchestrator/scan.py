@@ -25,13 +25,14 @@ from vvaharness.injectors.design_controls import load_controls
 from vvaharness.models import (ContextPackage, TaskManifest, Finding,
                     FinalReport, ThreatModel)
 from vvaharness.pipeline.stages import (
-    s1_preprocess, s1_autoexclude, s2_threatmodel, s3_decompose,
+    s0_seed, s1_preprocess, s1_autoexclude, s2_threatmodel, s3_decompose,
     s4_deepdive, s5_prefilter, s6_verify, s7_dedup, s8_chain)
 from vvaharness.util import metrics as _metrics
 from vvaharness.backends.llm import resolve as resolve_model
 from vvaharness.util.tokens import TOKENS
 from vvaharness.util import errlog as _errlog
 from vvaharness.util.status import stage
+from vvaharness.util.scan_progress import ScanProgress
 from vvaharness.report import enrich as vcs_enrich
 from vvaharness.report.redact import redact
 from vvaharness.orchestrator.config_paths import (_resolve_against, _iter_model_roles)
@@ -54,19 +55,42 @@ def _head_sha(repo: Path) -> str | None:
         return None
 
 
+def _hydrate_ctx_callgraph_from_store(run_id: str, ctx: ContextPackage,
+                                      *steps: str) -> ContextPackage:
+    """Use the stored SQLite callgraph for runtime prompt context.
+
+    The step list is searched in order; first hit wins.
+    """
+    for step in steps:
+        graph = _store.load_callgraph(run_id, step)
+        if not graph:
+            continue
+        print(
+            "  [graphdb] hydrated ctx.call_graph from sqlite: "
+            f"step={step} nodes={graph['node_count']} edges={graph['edge_count']}",
+            file=sys.stderr,
+        )
+        return ctx.model_copy(update={
+            "call_graph": graph["call_graph"],
+            "call_graph_files": graph["call_graph_files"],
+            "def_spans": graph["def_spans"],
+        })
+    return ctx
+
+
 def scan_repo(repo: Path, repo_name: str, application_id: str | None,
               args, cfg,
               path_prefix: str | None = None) -> tuple[Path | None, int]:
     """
-    Run the full s1→s10 pipeline against one local checkout.
+    Run the profile-selected S0/S1-S11 workflow against one local checkout.
 
     Returns (markdown_report_path, verified_finding_count). Raises on failure —
     the batch driver catches and records it. Returns (None, 0) when
-    --stop-after short-circuits before s8. Step 10 (remediation) only runs when
-    opted in via --remediate or cfg.step_remediate.enabled; it walks the
+    --stop-after short-circuits before s8. Step 10 (remediation) runs when
+    selected via --remediate or cfg.step_remediate.enabled; it walks the
     findings one-by-one with the Remediation Agent and writes per-finding
-    artefacts under <repo>/security-remediation/. Step 11 (validation) only
-    runs when opted in via cfg.step_validate.enabled; it reads those artefacts
+    artefacts under <repo>/security-remediation/. Step 11 (validation) runs
+    when cfg.step_validate.enabled; it reads those artefacts
     and fills each DTO's validation block via the vvaharness.validation package.
     """
     run_id = run_id_for(repo)
@@ -159,6 +183,19 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
                   f"globs={len(s1.get('exclude_globs') or [])})",
                   file=sys.stderr)
 
+    # Optional file/chunk progress tracker (stages consume cfg._scan_progress).
+    tracker = ScanProgress.from_cfg(cfg, repo_name=repo_name)
+    cfg._data["_scan_progress"] = tracker
+
+    def _sp_start(step_id: str, label: str) -> None:
+        if tracker.enabled:
+            tracker.stage_started(step_id, label=label)
+
+    def _sp_done(step_id: str, *, outcome: str = "completed",
+                 detail: str = "") -> None:
+        if tracker.enabled:
+            tracker.stage_done(step_id, outcome=outcome, detail=detail)
+
     print(f"Agentic SAST  repo={repo}  module={repo_name}  "
           f"app_id={application_id or '-'}  run_id={run_id}",
           file=sys.stderr)
@@ -180,13 +217,40 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
         mid, via, _ = resolve_model(getattr(cfg.models, role))
         return f"{mid} [{via}]"
 
+    # ── Step 0 — Static seed (profile-controlled) ──────────────────────
+    # Pure static, zero tokens. Runs the configured seed engine over the in-scope file set and
+    # returns EntryPoint/Sink/taint-path lists that s1 merges into the
+    # ContextPackage. default.yaml and taint.yaml enable it; sdk.yaml,
+    # full.yaml, and partial configs that inherit the scalar default disable it.
+    seed = load_ckpt(ckpt_dir, run_id, "s0") if args.resume else None
+    if seed is None:
+        s0_engine = getattr(getattr(cfg, "step0", None), "engine", "callgraph")
+        _sp_start("s0", f"{s0_engine}")
+        with stage(f"Step 0 — Static seed ({s0_engine})", n=0, total=11), \
+                TOKENS.phase("s0-seed"):
+            seed = s0_seed.run(str(repo), cfg, ckpt_dir=ckpt_dir)
+        save_ckpt(ckpt_dir, run_id, "s0", seed)
+        _sp_done("s0", detail=(f"entry_points={len(getattr(seed, 'entry_points', []) or [])} "
+                               f"sinks={len(getattr(seed, 'unsafe_sinks', []) or [])}"))
+    else:
+        _sp_done("s0", outcome="cached")
+    _store.save_callgraph(run_id, "s0", seed)
+    if args.stop_after == "s0":
+        return None, 0
+
     # ── Step 1 — Pre-process (runs first; s2 consumes its output) ───────
     ctx: ContextPackage | None = load_ckpt(ckpt_dir, run_id, "s1") if args.resume else None
     if ctx is None:
+        _sp_start("s1", f"{_m('preprocess')}")
         with stage(f"Step 1 — Pre-process ({_m('preprocess')})", n=1, total=11), \
                 TOKENS.phase("s1-preprocess"):
-            ctx = s1_preprocess.run(str(repo), cfg, cves, controls)
+            ctx = s1_preprocess.run(str(repo), cfg, cves, controls, seed=seed)
         save_ckpt(ckpt_dir, run_id, "s1", ctx)
+        _sp_done("s1", detail=f"files={len(getattr(ctx, 'all_files', []) or [])}")
+    else:
+        _sp_done("s1", outcome="cached")
+    _store.save_callgraph(run_id, "s1", ctx)
+    ctx = _hydrate_ctx_callgraph_from_store(run_id, ctx, "s1", "s0")
     ctx.app_profile = app_profile
     if args.stop_after == "s1":
         return None, 0
@@ -197,29 +261,45 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
                               if args.resume else None)
     if tm is None and s2_enabled:
         try:
+            _sp_start("s2", f"{_m('threatmodel')}")
             with stage(f"Step 2 — Threat model ({_m('threatmodel')})",
                        n=2, total=11), TOKENS.phase("s2-threatmodel"):
                 tm = s2_threatmodel.run(str(repo), repo_name, cfg, cves,
                                         controls, ctx=ctx,
                                         app_profile=app_profile)
             save_ckpt(ckpt_dir, run_id, "s2", tm)
+            _sp_done("s2", detail=(f"assets={len(tm.assets)} boundaries={len(tm.trust_boundaries)} "
+                                   f"threats={len(tm.threats)}"))
         except Exception as e:
             print(f"  [s2] WARN: threat-model step failed ({e}); "
                   f"continuing without it.", file=sys.stderr)
             _errlog.log("s2", repo_name, e)
+            _sp_done("s2", outcome="error",
+                     detail=redact(f"{type(e).__name__}: {e}"))
             tm = None
+    elif tm is not None:
+        _sp_done("s2", outcome="cached")
+    else:
+        _sp_done("s2", outcome="skipped", detail="disabled in config")
     # Always re-attach (s2/CMDB may differ across resumed runs).
     ctx.threat_model = tm
+    _store.save_callgraph(run_id, "s2", ctx)
+    ctx = _hydrate_ctx_callgraph_from_store(run_id, ctx, "s2", "s1", "s0")
     if args.stop_after == "s2":
         return None, 0
 
     # ── Step 3 ───────────────────────────────────────────────────────────
     manifest: TaskManifest | None = load_ckpt(ckpt_dir, run_id, "s3") if args.resume else None
     if manifest is None:
+        _sp_start("s3", f"{_m('decompose')}")
         with stage(f"Step 3 — Decompose ({_m('decompose')})", n=3, total=11), \
                 TOKENS.phase("s3-decompose"):
             manifest = s3_decompose.run(ctx, cfg)
         save_ckpt(ckpt_dir, run_id, "s3", manifest)
+        _sp_done("s3", detail=f"chunks={len(getattr(manifest, 'chunks', []) or [])}")
+    else:
+        _sp_done("s3", outcome="cached")
+    _store.save_callgraph(run_id, "s3", ctx)
     if args.stop_after == "s3":
         return None, 0
 
@@ -227,6 +307,7 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
     s4_ckpt = load_ckpt(ckpt_dir, run_id, "s4") if args.resume else None
     chunk_outcomes: dict[str, str] = {}
     if s4_ckpt is None:
+        _sp_start("s4", f"{_m('deepdive')}")
         with stage(f"Step 4 — Deep-dive ({_m('deepdive')}; {cfg.step4.runs} runs, "
                    f"vote≥{cfg.step4.vote_threshold}, "
                    f"parallel={getattr(cfg.step4, 'parallel', 1)})",
@@ -236,11 +317,15 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
         # rebuilds metrics still sees the coverage tally.
         save_ckpt(ckpt_dir, run_id, "s4",
                   {"findings": findings, "outcomes": chunk_outcomes})
+        _sp_done("s4", detail=f"findings={len(findings)}")
     elif isinstance(s4_ckpt, dict):
         findings = s4_ckpt.get("findings", [])
         chunk_outcomes = s4_ckpt.get("outcomes", {})
+        _sp_done("s4", outcome="cached")
     else:  # legacy bare-list checkpoint (pre outcome-tracking)
         findings = s4_ckpt
+        _sp_done("s4", outcome="cached")
+    _store.save_callgraph(run_id, "s4", ctx)
     if args.stop_after == "s4":
         return None, 0
 
@@ -249,26 +334,46 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
     # ── Steps 5+6+7 — Pre-filter + verify + dedup (checkpointed together) ──
     s7_ckpt = load_ckpt(ckpt_dir, run_id, "s7") if args.resume else None
     if s7_ckpt is None:
+        _sp_start("s5", "prefilter")
         with stage("Step 5 — Pre-filter (deterministic + semantic pre-dedup)",
                    n=5, total=11), TOKENS.phase("s5-prefilter"):
             findings, pre_dropped = s5_prefilter.run(findings, ctx, cfg)
+        _sp_done("s5", detail=f"kept={len(findings)} dropped={len(pre_dropped)}")
         if args.stop_after == "s5":
             return None, 0
+        # Re-hydrate callgraph context from SQLite right before verification so
+        # s6 always reasons over the latest persisted graph snapshot.
+        ctx = _hydrate_ctx_callgraph_from_store(run_id, ctx,
+                                                "s4", "s3", "s2", "s1", "s0")
+        _sp_start("s6", f"{_m('verify')}")
         with stage(f"Step 6 — Verify ({_m('verify')})", n=6, total=11), \
                 TOKENS.phase("s6-verify"):
             verified, dropped = s6_verify.run(findings, ctx, cfg)
+        _sp_done("s6", detail=f"verified={len(verified)} dropped={len(dropped)}")
         if args.stop_after == "s6":
             return None, 0
+        # Ensure s7 semantic dedup sees the latest sqlite-backed callgraph
+        # context before making root-cause grouping decisions.
+        ctx = _hydrate_ctx_callgraph_from_store(run_id, ctx,
+                                                "s4", "s3", "s2", "s1", "s0")
+        _sp_start("s7", f"{_m('dedup')}")
         with stage(f"Step 7 — Dedup ({_m('dedup')})", n=7, total=11), \
                 TOKENS.phase("s7-dedup"):
-            canonical, dup_dropped = s7_dedup.run(verified, cfg)
+            canonical, dup_dropped = s7_dedup.run(verified, cfg, ctx=ctx)
+        _sp_done("s7", detail=f"canonical={len(canonical)} dup_dropped={len(dup_dropped)}")
         save_ckpt(ckpt_dir, run_id, "s7",
                   (pre_dropped, verified, dropped, canonical, dup_dropped))
     elif len(s7_ckpt) == 5:
         pre_dropped, verified, dropped, canonical, dup_dropped = s7_ckpt
+        _sp_done("s5", outcome="cached")
+        _sp_done("s6", outcome="cached")
+        _sp_done("s7", outcome="cached")
     else:  # legacy 4-tuple checkpoint (pre_dropped not stored)
         verified, dropped, canonical, dup_dropped = s7_ckpt
         pre_dropped = []
+        _sp_done("s5", outcome="cached")
+        _sp_done("s6", outcome="cached")
+        _sp_done("s7", outcome="cached")
     # Honour --stop-after s5 / s6 even on a --resume that loaded a combined
     # s5+6+7 checkpoint: the in-branch early-returns above are skipped when
     # s7_ckpt is present, so without this the flags would be silently ignored.
@@ -276,10 +381,15 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
         return None, 0
     _enrich_findings(canonical, app_info, path_prefix=path_prefix)
     all_dropped = pre_dropped + dropped + dup_dropped
+    _store.save_callgraph(run_id, "s7", ctx)
     if args.stop_after == "s7":
         return None, 0
 
     # ── Step 8 — Chain ───────────────────────────────────────────────────
+    # Ensure chain analysis sees the latest sqlite-backed callgraph context
+    # for reachability reasoning and exploit-chain assembly.
+    ctx = _hydrate_ctx_callgraph_from_store(run_id, ctx,
+                                            "s4", "s3", "s2", "s1", "s0")
     report: FinalReport | None = load_ckpt(ckpt_dir, run_id, "s8") if args.resume else None
     if report is None:
         end_ts = _metrics.now_iso()
@@ -291,6 +401,7 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
             false_pos=fp, duplicates=len(dup_dropped),
             chunk_outcomes=chunk_outcomes,
         )
+        _sp_start("s8", f"{_m('chain')}")
         with stage(f"Step 8 — Chain ({_m('chain')})", n=8, total=11), \
                 TOKENS.phase("s8-chain"):
             report = s8_chain.run(canonical, ctx, cfg,
@@ -300,10 +411,16 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
         report.repo_name = repo_name
         report.threat_model = tm
         report.app_profile = app_profile
+        if getattr(cfg.output, "emit_unreachable_appendix", False):
+            report.unreachable_files = manifest.unreachable_files
         # B9: pin HEAD so step 10 (now or later via remediate --from-report)
         # can refuse on mismatch.
         report.git_sha = _head_sha(repo)
         save_ckpt(ckpt_dir, run_id, "s8", report)
+        _sp_done("s8", detail=f"findings={len(report.findings)} chains={len(report.chains)}")
+    else:
+        _sp_done("s8", outcome="cached")
+    _store.save_callgraph(run_id, "s8", ctx)
 
     # ── Output (always re-render — cheap, and s9 needs it on disk) ───────
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -319,6 +436,7 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
     # ── Step 9 — SARIF (parse the already-enriched MD) ──────────────────
     s9_done = load_ckpt(ckpt_dir, run_id, "s9") if args.resume else None
     if s9_done is None or not sarif_path.exists():
+        _sp_start("s9", "sarif")
         scan_health = {
             "executionSuccessful": not report.degraded,
             "degraded": report.degraded,
@@ -332,11 +450,15 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
                                     str(sarif_path), scan_health=scan_health)
         print(f"  [out] wrote {sarif_path}", file=sys.stderr)
         save_ckpt(ckpt_dir, run_id, "s9", str(sarif_path))
+        _sp_done("s9", detail=f"sarif={sarif_path.name}")
+    else:
+        _sp_done("s9", outcome="cached")
+    _store.save_callgraph(run_id, "s9", ctx)
     if args.stop_after == "s9":
         return out_path, len(report.findings)
 
-    # ── Step 10 — Remediate (opt-in) ────────────────────────────────────
-    # B3: runs INSIDE scan_repo() so the clone still exists. OFF unless
+    # ── Step 10 — Remediate (profile/flag-controlled) ───────────────────
+    # B3: runs INSIDE scan_repo() so the clone still exists. Selected by
     # --remediate or step_remediate.enabled. The Remediation Agent walks the
     # verified findings one-by-one and writes per-finding artefacts under
     # <repo>/security-remediation/<NN_slug>/ — exactly the same layout the
@@ -361,14 +483,19 @@ def scan_repo(repo: Path, repo_name: str, application_id: str | None,
     if args.stop_after == "s10":
         return out_path, len(report.findings)
 
-    # ── Step 11 — Validate (opt-in) ─────────────────────────────────────
+    # ── Step 11 — Validate (profile-controlled) ─────────────────────────
     val_cfg = getattr(cfg, "step_validate", None)
     val_on = bool(getattr(val_cfg, "enabled", False))
     if val_on:
-        with stage("Step 11 — Validate (s11)", n=11, total=11), \
-                TOKENS.phase("s11-validate"):
-            _run_validation(repo, cfg, config_path=args.config, resume=args.resume,
-                            report_md=out_path)
+        val_err = _validate_preflight(cfg)
+        if val_err:
+            print(f"  [s11] DISABLED — {val_err}", file=sys.stderr)
+            _errlog.log("s11.preflight", repo_name, RuntimeError(val_err))
+        else:
+            with stage("Step 11 — Validate (s11)", n=11, total=11), \
+                    TOKENS.phase("s11-validate"):
+                _run_validation(repo, cfg, config_path=args.config, resume=args.resume,
+                                report_md=out_path)
     if args.stop_after == "s11":
         return out_path, len(report.findings)
 
@@ -472,15 +599,15 @@ def _run_remediation(report: FinalReport, repo: Path, cfg, ckpt_dir, run_id,
         log_prefix="[s10]")
     findings = [_ranked_to_ra_finding(rf, idx) for idx, rf in enumerate(selected)]
 
-    # Only the Anthropic backends (cli/sdk) expose Edit/Write; via:openai is sandboxed to
-    # Read/Glob/Grep and cannot apply the diff, so don't claim we're about to edit.
+    # The Anthropic and DeepAgents harnesses expose confined Edit/Write tools;
+    # via:openai remains read-only on the legacy dispatcher.
     _, _remediate_via, _ = resolve_model(cfg.models.remediate)
-    if _remediate_via in ("cli", "sdk"):
+    if _remediate_via in ("cli", "sdk", "deepagents"):
         print(f"  [s10] ⚠ FIX MODE — about to EDIT source files in {repo}; "
               f"rerun with --stop-after s9 to scan without modifying the target", file=sys.stderr)
     else:
         print(f"  [s10] ⚠ {_remediate_via} backend cannot edit files (no Edit/Write tool); "
-              f"fix mode errors per finding — use report-only or an Anthropic via:cli/sdk role",
+              f"fix mode errors per finding — use report-only or via:cli/sdk/deepagents",
               file=sys.stderr)
     print(f"  [s10] remediating {len(findings)} finding(s) via Remediation Agent; "
           f"artefacts → {rem_dir}", file=sys.stderr)
@@ -521,11 +648,22 @@ def _remediate_preflight(cfg, args, repo: Path, report) -> str | None:
     None to proceed.
 
     Checks are scoped to what the Remediation Agent needs: a configured
-    ``models.remediate`` role and a stable working tree (so the report's line
-    numbers still match the code on disk)."""
+    ``models.remediate`` role, a usable credential for that role's backend, and a
+    stable working tree (so the report's line numbers still match the code on
+    disk)."""
     rem = getattr(cfg.models, "remediate", None)
     if rem is None:
         return "models.remediate must be set"
+
+    # The startup probe only WARNs on a post-scan credential gap so detection can
+    # still run; this is where that gap becomes the decision to skip s10.
+    # Imported locally: vvaharness.util.environment reaches back into the validation
+    # CLI, which imports this package.
+    from vvaharness.util.environment import _backend_credential_ok
+    model_id, via, _ = resolve_model(rem)
+    ready, detail = _backend_credential_ok(via, model_id, getattr(rem, "provider", None))
+    if not ready:
+        return f"models.remediate via:{via} — {detail}"
 
     # B9: refuse if the working tree has moved since the report was
     # built (line numbers would be stale → patch lands on wrong code).
@@ -535,3 +673,34 @@ def _remediate_preflight(cfg, args, repo: Path, report) -> str | None:
         return (f"HEAD moved since scan ({report.git_sha[:8]} → "
                 f"{cur[:8]}); pass --force to override")
     return None
+
+
+def _validate_preflight(cfg: object) -> str | None:
+    """Hard checks before in-scan s11 validation may run.
+
+    Returns an error string (which DISABLES validation for this repo, scan continues)
+    or None to proceed. Symmetrical with ``_remediate_preflight``: a configured
+    ``models.validate.orchestrator`` role, a backend s11 can actually run on, and a
+    usable credential for it. Mirrors ``util.environment._validate_checks`` so
+    ``vvaharness doctor`` and a real scan agree on what makes s11 runnable - the
+    startup probe only WARNs on a post-scan credential gap, so this is where that
+    gap turns into skipping the stage instead of failing the scan.
+    """
+    # Local import: see the note in _remediate_preflight.
+    from vvaharness.util.environment import _backend_credential_ok
+    from vvaharness.validation.cli._model import (
+        _normalize_validate_backend,
+        _validate_model_spec,
+    )
+
+    val = _validate_model_spec(cfg)
+    if val is None:
+        return "models.validate.orchestrator must be set"
+
+    model_id, via, _ = resolve_model(val)
+    # Same routing the validate CLI applies, so this gate checks the credential for the
+    # backend s11 will actually use rather than the one the profile spelled.
+    via, provider = _normalize_validate_backend(via, getattr(val, "provider", None))
+
+    ready, detail = _backend_credential_ok(via, model_id, provider)
+    return None if ready else f"models.validate.orchestrator via:{via} — {detail}"

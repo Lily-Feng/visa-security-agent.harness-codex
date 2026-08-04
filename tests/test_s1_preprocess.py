@@ -238,6 +238,44 @@ def test_shape_hash_env_kv_lines():
     assert ha is not None and ha == s1._shape_hash(b, ".env")
 
 
+# ─── gap_fill escalation policy ──────────────────────────────────────────
+def _seed(ep_count: int, sink_count: int, *, kind: str = "network"):
+    eps = [types.SimpleNamespace(kind=kind, reachable_from_unauth=False)
+           for _ in range(ep_count)]
+    sinks = [types.SimpleNamespace() for _ in range(sink_count)]
+    return types.SimpleNamespace(entry_points=eps, unsafe_sinks=sinks)
+
+
+def test_should_escalate_gap_fill_for_large_web_api_with_sparse_sinks():
+    files = [f"src/f{i}.py" for i in range(501)]
+    escalate, reason = s1._should_escalate_gap_fill(_seed(10, 4), files)
+    assert escalate is True
+    assert "source_files=501" in reason
+    assert "entry_points=10" in reason
+    assert "sinks=4" in reason
+
+
+def test_should_not_escalate_gap_fill_when_sinks_are_sufficient():
+    files = [f"src/f{i}.py" for i in range(700)]
+    escalate, reason = s1._should_escalate_gap_fill(_seed(12, 5), files)
+    assert escalate is False
+    assert reason == "sinks=5 >= 5"
+
+
+def test_should_not_escalate_gap_fill_for_small_repo():
+    files = [f"src/f{i}.py" for i in range(500)]
+    escalate, reason = s1._should_escalate_gap_fill(_seed(20, 0), files)
+    assert escalate is False
+    assert reason == "source_files=500 <= 500"
+
+
+def test_should_not_escalate_gap_fill_for_library_repo():
+    files = [f"src/f{i}.py" for i in range(800)]
+    escalate, reason = s1._should_escalate_gap_fill(_seed(20, 0, kind="file"), files)
+    assert escalate is False
+    assert reason == "repo_kind=['library']"
+
+
 # ─── _suspicious_set (security-relevant: secrets never silently dropped) ───
 def test_suspicious_set_detects_literal_password():
     text = "password: hunter2supersecret\n"
@@ -345,6 +383,44 @@ def test_resolve_callee_prefix_scoring_and_cap():
     assert out[0] == "a/b/c/x.py"
 
 
+def test_resolve_callee_prefers_import_aware_match_over_proximity():
+    def_files = {
+        "validate": {
+            "pkg/sub/services.py",          # correct import target
+            "pkg/sub/nearby/validate.py",   # closer but wrong
+            "pkg/other/validate.py",
+        },
+    }
+    caller_imports = {"validate": "pkg.sub.services"}
+    out = s1._resolve_callee_files(
+        "validate",
+        "pkg/sub/handler.py",
+        def_files,
+        max_targets=3,
+        caller_imports=caller_imports,
+    )
+    assert out[0] == "pkg/sub/services.py"
+
+
+def test_scan_imports_python_ast_handles_multiline_alias_and_relative():
+    lines = [
+        "from .services import (",
+        "    validate as v,",
+        ")",
+        "from ..common import sanitize",
+        "import os.path as osp",
+    ]
+    got = s1._scan_imports(lines, ".py", "pkg/sub/handler.py")
+    # Relative imports resolve against caller package path.
+    assert got["v"] == "pkg.sub.services"
+    assert got["sanitize"] == "pkg.common"
+    assert got["osp"] == "os.path"
+
+
+def test_file_matches_import_python_init_package():
+    assert s1._file_matches_import("pkg/sub/__init__.py", "pkg.sub", ".py")
+
+
 # ─── _scan_defs ────────────────────────────────────────────────────────────
 def test_scan_defs_python_function():
     lines = ["import os", "def handler(req):", "    pass"]
@@ -422,6 +498,54 @@ def test_walk_repo_offroot_symlink_dropped_even_with_follow_symlinks_true(tmp_pa
     assert "link_in.py" in out                 # in-tree symlink still followed
     assert "link_out.txt" not in out           # off-root STILL dropped despite flag
     assert "link_out.txt" in (excluded.get("symlinks") or {})   # and audited
+
+
+# ─── F36 fix 1: S0 reuse gated on language coverage ───────────────────────
+def test_seed_covered_languages_from_all_three_artifacts():
+    data = {
+        "def_spans": {"app.py::handle": [1, 5]},
+        "call_graph": {"svc.go::Serve": ["db.go::Query"]},
+        "call_graph_files": {"login": ["auth.java:12"]},
+    }
+    covered = s1._seed_covered_languages(data)
+    assert covered == {"python", "go", "java"}
+    # A language present only in the inventory (e.g. Ruby) is NOT covered, so
+    # the dispatch would route its files through the residual rebuild.
+    assert "ruby" not in covered
+
+
+def test_seed_covered_languages_empty_when_no_artifacts():
+    assert s1._seed_covered_languages({}) == set()
+
+
+def test_merge_graph_artifacts_unions_without_dropping_residual():
+    # data holds the residual (Ruby) rebuild; seed_* is S0's Python graph.
+    data = {
+        "call_graph": {"app.rb::handle": ["app.rb::render"]},
+        "call_graph_files": {"handle": ["app.rb:3"]},
+        "def_spans": {"app.rb::handle": [1, 9]},
+    }
+    seed_cg = {"svc.py::serve": ["svc.py::query"]}
+    seed_cgf = {"handle": ["svc.py:20"]}      # bare-name collision across langs
+    seed_spans = {"svc.py::serve": [4, 40]}
+
+    s1._merge_graph_artifacts(data, seed_cg, seed_cgf, seed_spans)
+
+    # both languages survive in the merged call graph
+    assert data["call_graph"]["app.rb::handle"] == ["app.rb::render"]
+    assert data["call_graph"]["svc.py::serve"] == ["svc.py::query"]
+    # colliding bare name unions both def-sites rather than overwriting
+    assert data["call_graph_files"]["handle"] == ["app.rb:3", "svc.py:20"]
+    # spans from both languages are present
+    assert data["def_spans"]["app.rb::handle"] == [1, 9]
+    assert data["def_spans"]["svc.py::serve"] == [4, 40]
+
+
+def test_merge_graph_artifacts_seed_span_wins_on_qnode_collision():
+    data = {"call_graph": {}, "call_graph_files": {},
+            "def_spans": {"a.py::f": [1, 2]}}
+    s1._merge_graph_artifacts(data, {}, {}, {"a.py::f": [1, 99]})
+    assert data["def_spans"]["a.py::f"] == [1, 99]   # S0 AST span authoritative
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -163,8 +163,8 @@ def test_repairs_windows_path_with_b_segment():
     assert out == {"p": r"C:\bin\app.exe"}
 
 
-# ── HB-009: ``` inside a JSON string value must not truncate the fence ───────
-def test_hb009_inner_backticks_do_not_truncate_fenced_object():
+# ── ``` inside a JSON string value must not truncate the fence ───────────────
+def test_inner_backticks_do_not_truncate_fenced_object():
     # The s8 chain narrative quotes a code block (```py x```) INSIDE a JSON
     # string, and the summary contains "[10]"-style finding refs. Pre-fix the
     # non-greedy fence match truncated at the inner ``` and the scanner returned
@@ -179,7 +179,7 @@ def test_hb009_inner_backticks_do_not_truncate_fenced_object():
     assert out["chains"][0]["narrative"] == "send ```py x``` then pivot"
 
 
-def test_hb009_inner_backticks_with_trailing_prose():
+def test_inner_backticks_with_trailing_prose():
     # Same as above but with prose AFTER the closing fence, so the anchored
     # fullmatch does NOT apply — exercises the defence-in-depth path (a list
     # matched inside a '{'-opening response is held, dict found in full text).
@@ -192,13 +192,13 @@ def test_hb009_inner_backticks_with_trailing_prose():
     assert out["chains"][0]["n"] == "```code``` here"
 
 
-def test_hb009_guard_inert_when_response_is_array():
+def test_want_dict_guard_inert_when_response_is_array():
     # The want-dict guard must NOT swallow a legitimate top-level array.
     text = '```json\n[{"index": 0}, {"index": 1}]\n```'
     assert extract_json(text) == [{"index": 0}, {"index": 1}]
 
 
-def test_hb009_held_list_returned_when_no_dict_anywhere():
+def test_held_list_returned_when_no_dict_anywhere():
     # Response opens with '{' (so want_dict is on) but the only PARSEABLE span
     # is a list — the held list must still be returned, not lost.
     text = '{unparseable [1, 2, 3] tail'

@@ -17,7 +17,6 @@
 from collections.abc import Mapping
 
 from vvaharness.validation.constants.scoring import (
-    COVERAGE_FLOOR,
     SCORE_FLOOR,
     SCORE_PRECISION,
 )
@@ -115,8 +114,13 @@ def _renormalized_score(cfg: ScoringConfig, raw: list[RawCriterion]) -> ScoreRes
 
     A skip is unevaluated — its weight is dropped from the denominator so it is
     weight-neutral, never an implicit failure. Returns the renormalized float, or an
-    UNVERIFIABLE ScoreResult when the evaluated weight is below COVERAGE_FLOOR (too
-    little coverage to trust a verdict).
+    UNVERIFIABLE ScoreResult when no gate was evaluated at all.
+
+    Coverage policy proper belongs to ``_critical_gate_error``: a critical gate that is
+    skipped or invalid short-circuits to UNVERIFIABLE before this runs, which is a
+    stronger guarantee than any aggregate weight threshold. The zero check below is
+    therefore the divide-by-zero guard, reachable only for a config with no critical
+    gates whose every criterion was skipped.
     """
     earned = 0.0
     active_weight = 0.0
@@ -125,14 +129,11 @@ def _renormalized_score(cfg: ScoringConfig, raw: list[RawCriterion]) -> ScoreRes
             continue
         active_weight += cfg.weights[c.name]
         earned += cfg.weights[c.name] * cfg.status_multiplier.get(c.status, SCORE_FLOOR)
-    if active_weight < COVERAGE_FLOOR:
+    if active_weight <= 0.0:
         return ScoreResult(
             raw_score=0.0,
             verdict_label=cfg.unverifiable_label,
-            justification=(
-                f"{cfg.unverifiable_label}: insufficient gate coverage "
-                f"(evaluated weight {active_weight:.4f} < {COVERAGE_FLOOR})."
-            ),
+            justification=f"{cfg.unverifiable_label}: no gates were evaluated.",
         )
     # clamp: a weights misconfig must never push the score above 1.0.
     return round(min(earned / active_weight, 1.0), SCORE_PRECISION)

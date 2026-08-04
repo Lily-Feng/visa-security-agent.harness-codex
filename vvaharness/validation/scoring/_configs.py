@@ -41,6 +41,13 @@ FIX_CONFIG = ScoringConfig(
     ),
     unverifiable_label=FixVerdict.UNVERIFIABLE,
     justify=build_fix_justification,
-    # The security gate is load-bearing: it cannot be skipped/garbled away or out-weighted.
-    critical_criteria=frozenset({GateName.NO_NEW_VULNERABILITIES.value}),
+    # Load-bearing gates: neither can be skipped/garbled away or out-weighted. Leaving
+    # root_cause unevaluated strands 43% of the score, so without this a fix nobody
+    # assessed could still read as Fixed on the remaining gates. _critical_gate_error
+    # owns coverage policy -- either of these unevaluated is UNVERIFIABLE outright, which
+    # no aggregate weight threshold can express.
+    critical_criteria=frozenset({
+        GateName.NO_NEW_VULNERABILITIES.value,
+        GateName.ROOT_CAUSE.value,
+    }),
 )

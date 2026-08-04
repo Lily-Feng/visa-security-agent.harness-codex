@@ -21,7 +21,9 @@ verdict instead of spending API budget.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +33,7 @@ from vvaharness.remediation_agent import plugin_runner
 from vvaharness.remediation_agent import prompts
 from vvaharness.remediation_agent import interactive
 from vvaharness.remediation_agent.models import RemediationVerdict
+from vvaharness.backends.harness import HarnessResult
 from vvaharness.remediation_agent.report_parser import (
     DONE_MARKER, find_scan_dir, latest_report, parse_findings, mark_done)
 
@@ -78,6 +81,7 @@ def cfg():
     from vvaharness.orchestrator import _default_config
     cfg = config_mod.load(str(_default_config()))
     cfg._data.setdefault("step_remediate", {})["enforce_policy"] = False
+    cfg._data["models"]["remediate"]["via"] = "cli"  # token-free tests stub the cli agentic seam
     return cfg
 
 
@@ -151,6 +155,19 @@ def test_system_prompt_embeds_schema():
     assert "verdict" in prompts.SYSTEM  # schema field name present
 
 
+def test_deepagents_profile_enables_remediation_with_safe_tools():
+    profiles_dir = Path(config_mod.__file__).resolve().parent / "profiles"
+    profile = config_mod.load(str(profiles_dir / "default.yaml"))
+    assert profile.models.remediate.via == "deepagents"
+    assert profile.models.remediate.provider == "anthropic"
+    assert profile.step_remediate.enabled is True
+    assert profile.step_remediate.enforce_policy is True
+    assert profile.step_remediate.allowed_tools == [
+        "Read", "Glob", "Grep", "Edit", "Write",
+    ]
+    assert "Bash" not in profile.step_remediate.allowed_tools
+
+
 def test_remediation_verdict_validates_canned_json():
     v = RemediationVerdict.model_validate(json.loads(_canned_verdict_json(1)))
     assert v.verdict == "Fixed"
@@ -187,6 +204,14 @@ def test_coerce_non_dict_degrades_safely():
     v = RemediationVerdict.coerce(["not", "a", "dict"], finding_index=2)
     assert v.verdict == "Needs Review"
     assert v.finding_index == 2
+
+
+def test_coerce_accepts_native_structured_verdict():
+    finding = parse_findings(_SAMPLE_REPORT)[0]
+    verdict = RemediationVerdict(verdict="Fixed", summary="native")
+    out = plugin_runner._coerce_verdict(verdict, finding)
+    assert out is verdict
+    assert out.finding_index == finding.index
 
 
 
@@ -582,6 +607,121 @@ def test_apply_plugin_wires_backend_and_validates(tmp_path, cfg, monkeypatch):
     assert (out / "remediate_report.json").is_file()
 
 
+def test_invoke_routes_deepagents_through_hoisted_harness(
+        tmp_path, cfg, monkeypatch):
+    calls = {}
+
+    class FakeHarness:
+        def run_streaming(self, prompt, options):
+            calls["prompt"] = prompt
+            calls["options"] = options
+
+            async def messages():
+                yield HarnessResult(
+                    subtype="success",
+                    structured=json.loads(_canned_verdict_json()),
+                )
+            return messages()
+
+    monkeypatch.undo()
+    cfg._data["models"]["remediate"] = {
+        "id": "gpt-5.5", "via": "deepagents",
+    }
+    monkeypatch.setattr(plugin_runner, "get_harness", lambda via: FakeHarness())
+    monkeypatch.setattr(
+        plugin_runner, "agentic",
+        lambda *args, **kwargs: pytest.fail("legacy dispatcher was called"),
+    )
+
+    finding = parse_findings(_SAMPLE_REPORT)[0]
+    raw = plugin_runner._invoke(finding, cfg, tmp_path, "fix")
+    options = calls["options"]
+    assert raw["verdict"] == "Fixed"
+    assert calls["prompt"].startswith(
+        "REPOSITORY ROOT: / (DeepAgents virtual workspace root)"
+    )
+    assert str(tmp_path.resolve()) not in calls["prompt"]
+    assert options.model == "gpt-5.5"
+    assert options.cwd == tmp_path
+    assert options.response_model is RemediationVerdict
+    assert options.allow_writes is True
+    assert options.writable_paths == (str(tmp_path.resolve()),)
+    assert "Bash" in options.tool_policy.disallowed_tools
+
+
+def test_virtualize_deepagents_prompt_preserves_finding_content(tmp_path):
+    original = (
+        f"REPOSITORY ROOT: {tmp_path}\n"
+        "MODE: fix\nPRIMARY FILE: services/workflow_service.py\n"
+    )
+    virtual = plugin_runner._virtualize_deepagents_prompt(original)
+    assert str(tmp_path) not in virtual
+    assert "MODE: fix" in virtual
+    assert "PRIMARY FILE: services/workflow_service.py" in virtual
+
+
+def test_invoke_deepagents_report_only_is_read_only(tmp_path, cfg, monkeypatch):
+    captured = {}
+
+    class FakeHarness:
+        def run_streaming(self, prompt, options):
+            captured["options"] = options
+
+            async def messages():
+                yield HarnessResult(subtype="success", result_text=_canned_verdict_json())
+            return messages()
+
+    monkeypatch.undo()
+    cfg._data["models"]["remediate"] = {
+        "id": "gpt-5.5", "via": "deepagents",
+    }
+    monkeypatch.setattr(plugin_runner, "get_harness", lambda via: FakeHarness())
+    finding = parse_findings(_SAMPLE_REPORT)[0]
+    plugin_runner._invoke(finding, cfg, tmp_path, "report-only")
+    assert captured["options"].allow_writes is False
+    assert captured["options"].writable_paths == ()
+
+
+def test_run_sync_bridges_an_active_event_loop():
+    async def value():
+        return 42
+
+    async def caller():
+        return plugin_runner._run_sync(value())
+
+    assert asyncio.run(caller()) == 42
+
+
+def test_run_sync_propagates_threaded_exception():
+    error = RuntimeError("boom")
+
+    async def fail():
+        raise error
+
+    async def caller():
+        with pytest.raises(RuntimeError, match="boom") as caught:
+            plugin_runner._run_sync(fail())
+        assert caught.value is error
+
+    asyncio.run(caller())
+
+
+@pytest.mark.parametrize("via", ["cli", "sdk", "openai"])
+def test_invoke_keeps_legacy_routes(tmp_path, cfg, monkeypatch, via):
+    calls = []
+    monkeypatch.undo()
+    cfg._data["models"]["remediate"] = {"id": "model", "via": via}
+    monkeypatch.setattr(
+        plugin_runner, "agentic",
+        lambda *args, **kwargs: calls.append(kwargs["model"]) or _canned_verdict_json(),
+    )
+    finding = parse_findings(_SAMPLE_REPORT)[0]
+    plugin_runner._invoke(finding, cfg, tmp_path, "fix")
+    assert len(calls) == 1
+    assert calls[0].id == "model"
+    assert calls[0].via == via
+
+
 
 def test_verbose_dumps_prompt_and_response(tmp_path, cfg, monkeypatch, capsys):
     """--verbose echoes the prompt and the raw model response to stderr."""
@@ -896,6 +1036,3 @@ def test_remediate_report_json_stays_valid_with_secret_in_fields(tmp_path):
     raw = dto_path.read_text(encoding="utf-8")
     assert "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789" not in raw
     assert dto["patch"]["remediation_summary"] == "moved token to env"
-
-
-

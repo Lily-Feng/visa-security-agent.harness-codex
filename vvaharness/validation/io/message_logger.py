@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import cast
 
-from vvaharness.validation.backends.contract.messages import (
+from vvaharness.backends.harness.contract.messages import (
     HarnessAssistantText,
     HarnessMessage,
     HarnessResult,

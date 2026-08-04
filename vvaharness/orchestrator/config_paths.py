@@ -79,5 +79,10 @@ _MODEL_ROLES = ("autoexclude", "preprocess", "threatmodel", "decompose",
 def _iter_model_roles(cfg):
     for r in _MODEL_ROLES:
         m = getattr(cfg.models, r, None)
-        if m is not None:
-            yield r, m
+        if m is None:
+            continue
+        if r == "validate":
+            m = getattr(m, "orchestrator", None)
+            if m is None:
+                continue
+        yield r, m

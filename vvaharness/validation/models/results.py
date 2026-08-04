@@ -24,9 +24,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from vvaharness.report.redact import redact
 from vvaharness.validation.constants.artifacts import DEFAULT_SEVERITY
 from vvaharness.validation.constants.paths import ValidationPath
-from vvaharness.validation.constants.verdicts import FixVerdict
 from vvaharness.validation.enums.readiness import MergeReadiness
-from vvaharness.validation.enums.verdicts import Answer
+from vvaharness.validation.enums.verdicts import Answer, FixVerdict
 
 
 class RunMetadata(BaseModel):

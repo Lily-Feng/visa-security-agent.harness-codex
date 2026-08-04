@@ -292,6 +292,7 @@ def _setup(rest: list[str]) -> int:
     write_env = "--write-env" in rest
 
     print(f"\n  ⟐  vvaharness {__version__} — setup\n")
+    _prompt_for_remediation_inputs()
     checks = env.run_checks(cfg_path)
     for c in checks:
         print(f"  {_ICON.get(c.status, '?')} {c.name:<30} {c.detail}")
@@ -348,6 +349,23 @@ def _setup(rest: list[str]) -> int:
                   + " — fill in any remaining keys, then "
                   "`set -a && source .env && set +a`")
 
+    # Taint profile convenience: make rulepack generation discoverable when the
+    # generated source/sink files are absent.
+    rules_dir = Path(__file__).resolve().parent / "rules"
+    src_gen = rules_dir / "sources.generated.yaml"
+    sink_gen = rules_dir / "sinks.generated.yaml"
+    if not src_gen.is_file() and not sink_gen.is_file():
+        print("\n  → Optional (taint profile): generated callgraph rulepacks not found")
+        print(f"      missing: {src_gen.name}, {sink_gen.name}")
+        print("      build them from local corpus clones:")
+        print("      python -m vvaharness.rules.build_kb \\")
+        print("        --semgrep /path/to/semgrep-rules \\")
+        print("        --codeql /path/to/codeql \\")
+        print(f"        --sources-out {src_gen} \\")
+        print(f"        --sinks-out {sink_gen}")
+        print("      No corpus clones yet? See docs/SETUP_GUIDE.md section")
+        print("      'Generated source/sink rule files (taint profile)'.")
+
     # Install agent operating instructions for whatever AI agent is present so
     # it runs the tool correctly. Opt-in (--install-agents); otherwise suggest.
     if "--install-agents" in rest:
@@ -367,6 +385,33 @@ def _setup(rest: list[str]) -> int:
           "source files in the target repo.")
     print("    For detection only (no code changes): vvaharness scan --repo … --stop-after s9\n")
     return 0
+
+
+def _prompt_for_remediation_inputs() -> None:
+    """Persist an inputs directory when wheel defaults cannot be resolved."""
+    from vvaharness.remediation_agent import rule_paths
+
+    missing = rule_paths.missing_rules(rule_paths.__file__)
+    if not missing or not sys.stdin.isatty():
+        return
+    print("  ! remediation defaults are missing: " + ", ".join(missing))
+    while True:
+        try:
+            answer = input(
+                "  Path to the VVAH inputs directory (blank to skip): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not answer:
+            return
+        directory, absent = rule_paths.validate_inputs_dir(answer)
+        if absent:
+            print(f"  ! {directory} is missing: {', '.join(absent)}")
+            continue
+        target = rule_paths.save_inputs_dir(directory)
+        print(f"  ✓ saved remediation inputs directory in {target}")
+        return
 
 
 def _print_help() -> None:

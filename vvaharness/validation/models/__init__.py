@@ -22,6 +22,13 @@ from vvaharness.validation.models.dto import (
     RemediationReport,
 )
 from vvaharness.validation.models.manifest import Manifest, ManifestFinding
+from vvaharness.validation.models.persona_report import (
+    EvidenceAnchor as PersonaEvidenceAnchor,
+)
+from vvaharness.validation.models.persona_report import (
+    PersonaGateEntry,
+    PersonaReport,
+)
 from vvaharness.validation.models.plans import FixValidationPlan
 from vvaharness.validation.models.results import (
     FixFindingReport,
@@ -52,6 +59,9 @@ __all__ = [
     "GateResult",
     "Manifest",
     "ManifestFinding",
+    "PersonaEvidenceAnchor",
+    "PersonaGateEntry",
+    "PersonaReport",
     "RawCriterion",
     "RawEvidence",
     "RawExtra",

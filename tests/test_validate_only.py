@@ -18,6 +18,7 @@ Fully offline/deterministic: validation.cli.main is monkeypatched so no model
 SDK, network, or LLM call is made.
 """
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -42,8 +43,12 @@ def _cfg(step_validate: dict | None = None) -> config_mod.Config:
 # ---------------------------------------------------------------------------
 
 
-def test_run_passes_repo_config_and_all(tmp_path: Path) -> None:
-    """run() with no finding_ids sends --repo + --config + --all."""
+def test_run_passes_repo_config_without_all(tmp_path: Path) -> None:
+    """run() with no finding_ids sends --repo + --config and NO --all.
+
+    Omitting --all is what lets step_validate.max_findings apply in-scan; passing it
+    would uncap the selection and make the profile budget dead config.
+    """
     seen: list[list[str]] = []
 
     with patch("vvaharness.validation.cli.main", side_effect=lambda a: seen.append(a) or 0):
@@ -54,8 +59,29 @@ def test_run_passes_repo_config_and_all(tmp_path: Path) -> None:
     # The scan's profile is forwarded so s11 reads the same config (F21).
     assert "--config" in seen[0]
     assert seen[0][seen[0].index("--config") + 1] == "prof.yaml"
-    assert "--all" in seen[0]
+    assert "--all" not in seen[0]
     assert "--finding" not in seen[0]
+
+
+def test_profile_max_findings_reaches_selection(tmp_path: Path) -> None:
+    """The in-scan argv (no --finding, no --all) resolves to a capped Selection.
+
+    End-to-end over the real parser + _resolve_selection: the profile's
+    step_validate.max_findings arrives as the config cap, so the top-N budget the
+    scan configured is the one validation enforces.
+    """
+    from vvaharness.validation.cli import _resolve_selection
+    from vvaharness.validation.cli._parser import _build_parser
+
+    seen: list[list[str]] = []
+    with patch("vvaharness.validation.cli.main", side_effect=lambda a: seen.append(a) or 0):
+        s11_validate.run(tmp_path, cfg=_cfg({"max_findings": 20}), config_path="prof.yaml")
+
+    args = _build_parser().parse_args(seen[0])
+    selection = _resolve_selection(args, SimpleNamespace(max_findings=20))
+
+    assert selection.finding_ids is None
+    assert selection.max_findings == 20
 
 
 def test_run_empty_config_path_falls_back_to_default(tmp_path: Path) -> None:
@@ -134,3 +160,83 @@ def test_scan_run_validation_warns_on_nonzero(
 
     captured = capsys.readouterr()
     assert "[s11] WARN" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# scan._validate_preflight — the s11 gate
+# ---------------------------------------------------------------------------
+# Symmetrical with _remediate_preflight: startup preflight only WARNs when a
+# post-scan role's credential is missing, so this gate is what turns that gap into
+# `[s11] DISABLED` while the rest of the scan completes.
+
+
+def _val_cfg(orchestrator: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        models=SimpleNamespace(validate=SimpleNamespace(orchestrator=orchestrator)))
+
+
+def _credential(monkeypatch: pytest.MonkeyPatch, *, ready: bool, detail: str) -> None:
+    """Pin the backend-credential answer. Patched on the environment module because
+    _validate_preflight imports the helper at call time (circular-import avoidance)."""
+    from vvaharness.util import environment
+    monkeypatch.setattr(environment, "_backend_credential_ok",
+                        lambda *_a, **_k: (ready, detail))
+
+
+def test_validate_preflight_blocks_when_role_missing() -> None:
+    from vvaharness.orchestrator import scan
+
+    err = scan._validate_preflight(_val_cfg(None))
+    assert err and "models.validate.orchestrator" in err
+
+
+def test_validate_preflight_routes_legacy_openai_to_deepagents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`via: openai` is no longer refused outright — it is checked as DeepAgents.
+
+    The credential probe must see the backend s11 will actually run on, so a role
+    spelled `via: openai` passes preflight once the DeepAgents/OpenAI credential is
+    present, instead of aborting on the selector alone.
+    """
+    from vvaharness.orchestrator import scan
+
+    _credential(monkeypatch, ready=True, detail="credential present")
+    err = scan._validate_preflight(
+        _val_cfg(SimpleNamespace(id="gpt-5.5", via="openai")))
+    assert err is None
+
+
+def test_validate_preflight_reports_routed_backend_on_credential_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The message names the routed backend, not the profile spelling, so the operator
+    # is pointed at the credential that is actually missing.
+    from vvaharness.orchestrator import scan
+
+    _credential(monkeypatch, ready=False, detail="OPENAI_API_KEY not set")
+    err = scan._validate_preflight(
+        _val_cfg(SimpleNamespace(id="gpt-5.5", via="openai")))
+    assert err and "via:deepagents" in err and "OPENAI_API_KEY" in err
+
+
+def test_validate_preflight_blocks_when_credential_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vvaharness.orchestrator import scan
+
+    _credential(monkeypatch, ready=False, detail="OPENAI_API_KEY not set")
+    err = scan._validate_preflight(
+        _val_cfg(SimpleNamespace(id="gpt-5.5", via="deepagents", provider="openai")))
+    assert err and "via:deepagents" in err and "OPENAI_API_KEY not set" in err
+
+
+def test_validate_preflight_passes_with_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vvaharness.orchestrator import scan
+
+    _credential(monkeypatch, ready=True, detail="credential present")
+    assert scan._validate_preflight(
+        _val_cfg(SimpleNamespace(id="gpt-5.5", via="deepagents",
+                                 provider="openai"))) is None

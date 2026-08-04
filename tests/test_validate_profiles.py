@@ -39,7 +39,7 @@ def test_shipped_profile_validate_model_resolves(profile: str, monkeypatch) -> N
     path = _PROFILE_DIR / f"{profile}.yaml"
     assert path.exists(), f"missing shipped profile {path}"
 
-    rc, _overrides = _apply_model_env(str(path))
+    rc, overrides = _apply_model_env(str(path))
 
     assert rc == 0, f"{profile}.yaml: validate role not on an Anthropic-compatible endpoint"
-    assert os.environ.get("VVAHARNESS_MODEL"), f"{profile}.yaml: no validate model exported"
+    assert overrides.get("model"), f"{profile}.yaml: no validate model in overrides"

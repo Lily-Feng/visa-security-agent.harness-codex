@@ -28,11 +28,17 @@ from pathlib import Path
 
 import yaml
 
+from vvaharness.remediation_agent.rule_paths import locate_rule
+
 log = logging.getLogger(__name__)
 
-# Shipped rules live in the repo-root inputs/ folder.
-RULES_DIR = Path(__file__).resolve().parent.parent.parent / "inputs"
-DEFAULT_PLAYBOOK_PATH = RULES_DIR / "remediation_playbook.yaml"
+def _default_playbook_path() -> Path:
+    """Locate the playbook in a source checkout or an installed wheel."""
+    return locate_rule("remediation_playbook.yaml", __file__)
+
+
+DEFAULT_PLAYBOOK_PATH = _default_playbook_path()
+RULES_DIR = DEFAULT_PLAYBOOK_PATH.parent
 
 
 @dataclass

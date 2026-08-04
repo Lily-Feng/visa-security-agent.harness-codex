@@ -33,7 +33,8 @@ enabled** — no shipped profile does this; it requires a `via: cli` role that
 adds `- Bash` to its `allowed_tools`. There the `claude` subprocess can run shell commands inside
 the target directory for repo inventory and evidence retrieval. The `sdk` and
 `openai` backends have **no Bash** — they use only the sandboxed Read/Glob/Grep
-tool loop (below). If you are scanning untrusted code and want to avoid any shell
+tool loop (below). DeepAgents has no shell backend: S10 fix mode can use a
+repo-confined filesystem, while S11 agents are read-only. If you are scanning untrusted code and want to avoid any shell
 execution against it, use a profile whose agentic roles are `via: sdk` /
 `via: openai`, or keep `Bash` out of `allowed_tools`.
 
@@ -72,21 +73,26 @@ agent's permission sandbox. (For the command reference — flags, gates,
 verdicts — see [validation.md](validation.md); this section covers the trust
 model only.)
 
-- **SDK permission sandbox.** The panel runs through the Claude Agent SDK with a
-  permission sandbox: the persona subagents are read-only (Read/Grep/Glob;
-  Write and Edit are denied in their definitions), and the lead session agent
-  may write only the validation artifacts (`validation_report.json`,
-  `synthesized_gates.json`) to the workspace root. Nothing in the session can
-  apply a patch, mutate source, or write elsewhere. There is **no
-  Docker runner** and no build/test execution against the target.
-- **Anthropic-only (enforced before any validation model call).**
-  `models.validate` must resolve to `via: cli` or `via: sdk`; a `via: openai`
-  validate model (or per-persona override) is refused at the start of the
-  validate step — before discovery or any model spend — so no finding data is
-  ever sent to a non-Anthropic endpoint for validation. The standalone
-  `validate` command exits non-zero; inside a `scan`, Step 11 is skipped with a
-  warning. (This is *not* the scan startup preflight, which only probes backend
-  connectivity.)
+- **Read-only sessions.** Parent and persona agents can inspect the staged repo
+  with Read/Grep/Glob and dispatch personas, but receive no Write/Edit/Bash.
+  DeepAgents also exposes deterministic read-only diff, changed-line, impact,
+  pattern-scan, and test-inventory helpers. Agents return structured output;
+  host code alone writes temporary `validation_report.json` /
+  `synthesized_gates.json`, updates the DTO, and removes the workspace. No
+  target build or test is executed.
+- **Know which endpoint receives finding data.** `models.validate` resolves to
+  `via: cli`, `via: sdk`, or `via: deepagents`, and a legacy `via: openai` value is
+  routed to `via: deepagents` with the OpenAI provider when the step starts. The
+  panel's egress target is therefore the *provider*, not the `via:` spelling: a
+  `deepagents` role with `provider: openai` sends finding data to an
+  OpenAI-compatible endpoint. **The shipped `default.yaml` stays on Anthropic**
+  (`{id: claude-opus-5, via: deepagents, provider: anthropic}`), so validation
+  data does not leave an Anthropic endpoint by default. To keep it that way,
+  leave the validate role on `via: cli` / `via: sdk`, or on `via: deepagents`
+  with `provider: anthropic`; repointing it at an OpenAI provider route changes
+  the egress target. If your policy permits an approved OpenAI-compatible gateway,
+  pin it with `OPENAI_BASE_URL`. `vvaharness doctor` prints the resolved backend
+  and discloses routing (`via:openai routed to deepagents`).
 - **Adversarial panel.** Two always-on personas — a `security-architect` and a
   `penetration-tester` — review each fix independently, plus a conditional
   `cross-repo-analyzer` spawned only when a fix spans 2+ repositories; the
@@ -97,9 +103,9 @@ model only.)
   FIXED is written back with the terminal `validated` status, which is *not* in
   the validatable set — a repeated `validate` skips it. A non-passing verdict is
   written back as `validation_failed`, which **stays re-validatable** on the next
-  run (so a corrected patch re-drives with no manual DTO edit); `--resume`
-  additionally reprints the cached verdict for findings already validated in a
-  prior run rather than re-validating them.
+  run (so a corrected patch re-drives with no manual DTO edit). `--resume` may
+  reuse a matching checkpoint only for a DTO that is still in a validatable
+  status; terminal `validated` DTOs are filtered out before checkpoint lookup.
 - **Read-only against the repo.** Nothing the panel produces is auto-applied;
   the verdict and weighted gate scores are written back into each DTO's
   `validation` block for human review.
@@ -145,7 +151,8 @@ model (see below).
 To analyze a repo, the pipeline necessarily sends the **source code under scan**
 to whichever provider each role is routed to: the Anthropic API (`via: sdk`),
 an OpenAI-compatible endpoint (`via: openai`), or the Anthropic backend the
-`claude` CLI is logged into (`via: cli`). Use a backend/endpoint your
+`claude` CLI is logged into (`via: cli`). DeepAgents sends S10/S11 context to
+the provider selected on that role (`anthropic` or `openai`). Use a backend/endpoint your
 organization permits for the code in question — e.g. a private Anthropic gateway
 (`ANTHROPIC_SDK_BASE_URL` / `ANTHROPIC_BASE_URL`) rather than the public API —
 and for sensitive code prefer one with a no-/zero-retention data policy.

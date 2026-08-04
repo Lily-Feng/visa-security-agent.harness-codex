@@ -741,6 +741,85 @@ def test_agentic_pairs_verbose_with_stream_json(monkeypatch):
     assert cmd[oi + 2] == "--verbose"
 
 
+def test_is_pending_result_detects_background_markers():
+    assert claude_cli._is_pending_result("__PENDING__") is True
+    assert claude_cli._is_pending_result("still executing in background") is True
+    assert claude_cli._is_pending_result("Task is still pending") is True
+    assert claude_cli._is_pending_result("waiting for sub-agent to finish") is True
+    assert claude_cli._is_pending_result("waiting for background subagent") is True
+    assert claude_cli._is_pending_result("normal final output") is False
+
+
+def test_agentic_retries_pending_result_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_rwr(cmd, *, label, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return subprocess.CompletedProcess(
+                ["claude"], 0,
+                json.dumps({"result": "__PENDING__ still executing", "usage": {}}),
+                "",
+            )
+        return subprocess.CompletedProcess(
+            ["claude"], 0,
+            json.dumps({"result": "final-json", "usage": {}}),
+            "",
+        )
+
+    monkeypatch.setattr(claude_cli, "_run_with_retry", fake_rwr)
+    monkeypatch.setattr(claude_cli.time, "sleep", lambda s: None)
+
+    out = claude_cli.agentic("hi", model="m", cwd=".")
+    assert out == "final-json"
+    assert calls["n"] == 2
+
+
+def test_agentic_raises_when_pending_persists(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_rwr(cmd, *, label, **kw):
+        calls["n"] += 1
+        return subprocess.CompletedProcess(
+            ["claude"], 0,
+            json.dumps({"result": "__PENDING__ still executing", "usage": {}}),
+            "",
+        )
+
+    monkeypatch.setattr(claude_cli, "_run_with_retry", fake_rwr)
+    monkeypatch.setattr(claude_cli.time, "sleep", lambda s: None)
+
+    with pytest.raises(RuntimeError, match="unfinished background-subagent"):
+        claude_cli.agentic("hi", model="m", cwd=".")
+    # Initial call + exactly _PENDING_MAX_RETRIES retries.
+    assert calls["n"] == claude_cli._PENDING_MAX_RETRIES + 1
+
+
+def test_agentic_retries_pending_subagent_wording_variant(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_rwr(cmd, *, label, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return subprocess.CompletedProcess(
+                ["claude"], 0,
+                json.dumps({"result": "Task is still pending; waiting for sub-agent", "usage": {}}),
+                "",
+            )
+        return subprocess.CompletedProcess(
+            ["claude"], 0,
+            json.dumps({"result": "final-json", "usage": {}}),
+            "",
+        )
+
+    monkeypatch.setattr(claude_cli, "_run_with_retry", fake_rwr)
+    monkeypatch.setattr(claude_cli.time, "sleep", lambda s: None)
+
+    out = claude_cli.agentic("hi", model="m", cwd=".")
+    assert out == "final-json"
+    assert calls["n"] == 2
+
+
 def test_prompt_uses_json_and_no_verbose(monkeypatch):
     captured = _capture_cmd(monkeypatch)
     _fake_caps(monkeypatch, max_turns=True)

@@ -66,6 +66,8 @@ def _make_cfg():
         taint_max_chunks=40,
         taint_files_per_hop=5,
         pack_by="loc",
+        threat_surface_fallbacks=True,
+        threat_fallback_max_files=12,
     )
     return SimpleNamespace(step3=step3)
 
@@ -222,6 +224,34 @@ def test_no_matching_threat_yields_none():
     assert _taint_chunk(manifest).threat_id is None
 
 
+def test_seed_taint_paths_are_promoted_into_taint_chunks():
+    ctx = ContextPackage(
+        repo_root="/nonexistent-repo",
+        language="python",
+        call_graph={},
+        def_spans={
+            "app/api.py::entry": [10, 30],
+            "app/db.py::run_query": [40, 70],
+        },
+        entry_points=[EntryPoint(file="app/api.py", function="entry", kind="network",
+                                 reachable_from_unauth=True)],
+        unsafe_sinks=[Sink(file="app/db.py", line=55, function="run_query",
+                           cwe=["CWE-89"])],
+        all_files=["app/api.py", "app/db.py"],
+        seed_taint_paths=[["app/api.py:12", "app/db.py:55"]],
+        threat_model=ThreatModel(threats=[_threat("T1", "entry")]),
+    )
+    manifest = TaskManifest(chunks=[], rationale="test")
+
+    n = s3_decompose._add_taint_chunks(manifest, ctx, _make_cfg())
+
+    assert n == 1
+    chunk = _taint_chunk(manifest)
+    assert chunk.source_ref == "app/api.py:12"
+    assert chunk.sink_ref == "app/db.py:55"
+    assert "CWE-89" in chunk.sink_cwe
+
+
 def test_digit_tokens_participate_in_matching():
     # tokens are [a-z0-9]+, so a shared numeric token counts.
     manifest = _run(_ctx_with([_threat("T4", "endpoint_v2")], fn="parse_v2"))
@@ -239,3 +269,101 @@ def test_tokenization_rule_matches_source_intent():
     # substring-only does NOT create token overlap
     assert not (tok("handle_login") & tok("log"))
     assert not (tok("auth") & tok("authenticate"))
+
+
+def test_threat_surface_fallback_adds_supply_chain_probe_chunk(tmp_path):
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "ci.yml").write_text("name: ci\n", encoding="utf-8")
+    app = tmp_path / "src"
+    app.mkdir(parents=True)
+    (app / "main.py").write_text("print('ok')\n", encoding="utf-8")
+
+    ctx = ContextPackage(
+        repo_root=str(tmp_path),
+        language="python",
+        all_files=[".github/workflows/ci.yml", "src/main.py"],
+        threat_model=ThreatModel(threats=[
+            Threat(
+                id="T10",
+                threat="CI/CD workflow tampering in build pipeline",
+                actor="supply_chain",
+                surface="github_actions",
+                asset="release artifact",
+                impact="high",
+                likelihood="possible",
+            )
+        ]),
+    )
+    manifest = TaskManifest(
+        chunks=[Chunk(id="spec-iac-01", files=[".github/workflows/ci.yml"], specialist="iac")],
+        rationale="test",
+    )
+
+    n = s3_decompose._add_threat_surface_fallback_chunks(manifest, ctx, _make_cfg())
+
+    assert n == 1
+    fallback = next(c for c in manifest.chunks if c.id.startswith("threat-t10-fallback"))
+    assert fallback.threat_id == "T10"
+    assert ".github/workflows/ci.yml" in fallback.files
+
+
+def test_threat_surface_fallback_adds_access_control_probe_chunk(tmp_path):
+    svc = tmp_path / "src"
+    svc.mkdir(parents=True)
+    (svc / "authz.py").write_text("def allow(user):\n    return True\n", encoding="utf-8")
+    (svc / "main.py").write_text("def run():\n    return 0\n", encoding="utf-8")
+
+    ctx = ContextPackage(
+        repo_root=str(tmp_path),
+        language="python",
+        all_files=["src/authz.py", "src/main.py"],
+        threat_model=ThreatModel(threats=[
+            Threat(
+                id="T7",
+                threat="Authorization policy bypass on tenant boundary",
+                actor="remote_auth",
+                surface="rbac policy",
+                asset="tenant data",
+                impact="high",
+                likelihood="possible",
+            )
+        ]),
+    )
+    manifest = TaskManifest(chunks=[], rationale="test")
+
+    n = s3_decompose._add_threat_surface_fallback_chunks(manifest, ctx, _make_cfg())
+
+    assert n == 1
+    fallback = next(c for c in manifest.chunks if c.id.startswith("threat-t7-fallback"))
+    assert fallback.threat_id == "T7"
+    assert "src/authz.py" in fallback.files
+
+
+def test_threat_surface_fallback_skips_when_no_surface_candidates(tmp_path):
+    p = tmp_path / "src"
+    p.mkdir(parents=True)
+    (p / "core.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+
+    ctx = ContextPackage(
+        repo_root=str(tmp_path),
+        language="python",
+        all_files=["src/core.py"],
+        threat_model=ThreatModel(threats=[
+            Threat(
+                id="T99",
+                threat="Air-gap side-channel in custom FPGA transport",
+                actor="local_user",
+                surface="fpga_dma",
+                asset="compute node",
+                impact="medium",
+                likelihood="very_rare",
+            )
+        ]),
+    )
+    manifest = TaskManifest(chunks=[], rationale="test")
+
+    n = s3_decompose._add_threat_surface_fallback_chunks(manifest, ctx, _make_cfg())
+
+    assert n == 0
+    assert all(c.threat_id != "T99" for c in manifest.chunks)

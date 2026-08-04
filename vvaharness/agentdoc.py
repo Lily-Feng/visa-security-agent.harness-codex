@@ -42,15 +42,25 @@ do not develop or repair it.**
 
 ## Run it
 ```
-pipx install .            # or: pip install .
+pipx install vvaharness            # or: pip install vvaharness
 vvaharness setup                   # checks Python, agents, keys, gateway, config
-vvaharness scan --repo <path> --application-id <id>
+vvaharness scan --repo <path> --application-id <id> --stop-after s9
 ```
-- Public/subscription users: an Anthropic API key (`ANTHROPIC_SDK_API_KEY`) or
-  `claude login` is enough — nothing else.
-- Enterprise gateway: also `export ANTHROPIC_BASE_URL=<gateway>` (and
-  `NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` if needed).
-  `setup` auto-detects this and prints the exact lines.
+- The shipped default is mixed: local S0, Claude CLI for S1-S9,
+  DeepAgents/Anthropic for S10, and DeepAgents/OpenAI for S11. A complete run
+  needs credentials for each enabled backend. `setup` reports missing pieces.
+- A plain default-profile `scan` continues into S10 fix mode and can edit target
+  source. Keep `--stop-after s9` for detection only.
+- `sdk.yaml` spells every role `via: sdk`; its detection and S10 paths use
+  `ANTHROPIC_SDK_API_KEY`, while S11 pins external `claude` and uses ambient
+  Claude login / `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` /
+  `ANTHROPIC_AUTH_TOKEN`. The SDK-named key alone does not authenticate S11. A
+  standard Anthropic credential can cover all stages through the sole-SDK
+  detection fallback.
+- For an enterprise gateway, use the endpoint/trust variables for the selected
+  backend (`ANTHROPIC_SDK_BASE_URL` for direct SDK detection;
+  `ANTHROPIC_BASE_URL` for Claude/DeepAgents paths). Run `setup` for exact
+  environment guidance.
 
 ## On failure
 Read the one-line `✗ scan failed: …`, run `vvaharness doctor`, fix what it

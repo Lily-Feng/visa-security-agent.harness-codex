@@ -32,12 +32,17 @@ from vvaharness.remediation_agent.policy_gate.loader import (
     _norm_cwe, parse_policy)
 from vvaharness.remediation_agent.policy_gate.matching import (
     _first_match, _glob_match)
+from vvaharness.remediation_agent.rule_paths import locate_rule
 
 log = logging.getLogger(__name__)
 
-# Shipped rules live in the repo-root inputs/ folder.
-RULES_DIR = Path(__file__).resolve().parent.parent.parent.parent / "inputs"
-DEFAULT_POLICY_PATH = RULES_DIR / "remediation_policy.yaml"
+def _default_policy_path() -> Path:
+    """Locate the policy in a source checkout or an installed wheel."""
+    return locate_rule("remediation_policy.yaml", __file__)
+
+
+DEFAULT_POLICY_PATH = _default_policy_path()
+RULES_DIR = DEFAULT_POLICY_PATH.parent
 
 _TRUE = ("1", "true", "yes", "on")
 
