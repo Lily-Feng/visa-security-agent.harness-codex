@@ -25,7 +25,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from vvaharness.backends import claude_cli as cli
+from vvaharness.backends import llm as cli
 from vvaharness.util.tokens import TOKENS
 from vvaharness.util import errlog as _errlog
 from vvaharness.orchestrator.cleanup import (_rmtree_rw, _preserve_set,

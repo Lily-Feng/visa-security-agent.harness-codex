@@ -21,6 +21,68 @@ reference, see **[USER_GUIDE.md](USER_GUIDE.md)**.
 
 ---
 
+## 5. Backends & swapping roles
+
+| `via:` | Transport | Auth | Notes |
+|---|---|---|---|
+| `cli` | `claude` CLI subprocess | run `claude` then `/login`, or `CLAUDE_CODE_OAUTH_TOKEN` | the default profile; only backend capable of **Bash**, which still must be allowlisted |
+| `codex` | `codex exec` subprocess | `codex login` | native ChatGPT/Codex auth; ephemeral read-only S0–S9 detection |
+| `sdk` | Anthropic Python SDK for detection; Claude Agent SDK for S10 fix/S11 | SDK key for detection/S10; S11 pins external `claude` and uses Claude login/OAuth or standard Anthropic auth (SDK key alone is insufficient) | detection honours `temperature`, `max_turns`; sandboxed Read/Glob/Grep; direct detection transport alone exposes **mTLS** |
+| `openai` | OpenAI-compatible API | `OPENAI_API_KEY` | any compatible endpoint via `OPENAI_BASE_URL`; sandboxed Read/Glob/Grep |
+| `deepagents` | DeepAgents/LangGraph provider harness | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` or `OPENAI_API_KEY` | S10/S11 only; S10 fix mode has repo-confined writes, S11 is read-only; Bash denied |
+
+The `cli`/`sdk` rows describe detection. S11 maps both selectors to the
+read-only Claude Agent SDK Harness; S10 remains direct CLI for `via: cli` and
+delegates fix-mode Edit/Write to the Agent SDK for `via: sdk`.
+
+Swapping is config-only — no code change:
+
+```yaml
+models:
+  deepdive: {id: <model-id>, via: openai}
+  verify:   {id: <model-id>, via: sdk}
+```
+
+See [models.md](models.md) for the role→backend matrix.
+
+---
+
+## 6. Optional context inputs
+
+The `inject` block points at optional files that enrich findings. Only the
+`*.example.*` templates ship; copy them to the real names referenced by the
+config (or point `inject.*` at your own paths):
+
+```bash
+cp inputs/cmdb.example.csv          inputs/cmdb.csv
+cp inputs/known_cves.example.json   inputs/known_cves.json
+cp inputs/design_controls.example.yaml inputs/design_controls.yaml
+```
+
+If a file is absent the pipeline still runs — the corresponding enrichment is
+simply skipped (e.g. without a CMDB export, base CVSS + OffensivePriority are
+still computed; only VulContextSeverity environmental scoring is skipped). The
+real-data filenames (`inputs/cmdb.csv`, `inputs/repos.csv`,
+`inputs/design_controls.yaml`, `inputs/known_cves.json`) are git-ignored, so
+they aren't committed by an ordinary `git add` — only the shipped
+`*.example.*` templates are tracked. (A `git add -f` can still force one in,
+so don't override the ignore for a file holding real internal data.)
+
+For batch scanning, see [repos-csv.md](repos-csv.md) and the worked
+example at `inputs/repos.example.csv`.
+
+---
+
+## 7. Verifying the install
+
+```bash
+vvaharness --help
+vvaharness doctor
+vvaharness estimate --repo /path/to/some/repo
+```
+
+If `doctor` reports all configured backends present and reachable, you're ready
+to `vvaharness scan` (see [USER_GUIDE.md](USER_GUIDE.md)).
 ## 1. Prerequisites
 
 | Need | Why |
@@ -244,7 +306,7 @@ Notes:
 
 ## 4. Configuration profiles
 
-`vvaharness` ships four profiles under `vvaharness/config/profiles/`:
+`vvaharness` ships five profiles under `vvaharness/config/profiles/`:
 
 - **`default.yaml`** — mixed-backend layout. S1–S9 (detection) run `via: cli`
   (the `claude` CLI subprocess) using your Claude Code login. S10 remediate and
@@ -255,6 +317,10 @@ Notes:
   the target directory; Bash is off unless you add `- Bash` to a role's
   `allowed_tools` — for untrusted targets prefer `via: sdk` / `via: openai`
   (sandboxed Read/Glob/Grep, no shell); see [`security.md`](security.md).
+- **`codex.yaml`** — S0–S9 detection runs through `codex exec`
+  (`via: codex`), reusing `codex login` (including ChatGPT authentication)
+  without `OPENAI_API_KEY`. Invocations are ephemeral and read-only, target
+  AGENTS.md discovery is disabled, and S10/S11 are disabled.
 - **`sdk.yaml`** — every configured role is spelled `via: sdk`. Detection uses
   the Anthropic Python SDK, S10 translates `ANTHROPIC_SDK_API_KEY` into its
   Claude Agent SDK environment, and S11 uses the same Harness but pins an
@@ -371,7 +437,7 @@ Key sections (full reference in [configuration.md](configuration.md)):
 - `step_remediate` / `step_validate` — the remediation (stage 10) and
   validation (stage 11) stages: `enabled`, budgets, and tool allowlists. They are
   enabled in `default.yaml`, `sdk.yaml`, and `full.yaml`, and disabled in
-  `taint.yaml`.
+  `codex.yaml` and `taint.yaml`.
 - `inject` — paths to optional context inputs (see §6).
 - `batch` — clone token / base URL / skip patterns for `--repo-file` mode.
 - `output.preserve_on_cleanup` — folders kept when a clone is purged.
@@ -393,65 +459,3 @@ Key sections (full reference in [configuration.md](configuration.md)):
 > controls in [`security.md` → Hardening for less-trusted or sensitive targets](security.md#hardening-for-less-trusted-or-sensitive-targets).
 
 ---
-
-## 5. Backends & swapping roles
-
-| `via:` | Transport | Auth | Notes |
-|---|---|---|---|
-| `cli` | `claude` CLI subprocess | run `claude` then `/login`, or `CLAUDE_CODE_OAUTH_TOKEN` | the default profile; only backend capable of **Bash**, which still must be allowlisted |
-| `sdk` | Anthropic Python SDK for detection; Claude Agent SDK for S10 fix/S11 | SDK key for detection/S10; S11 pins external `claude` and uses Claude login/OAuth or standard Anthropic auth (SDK key alone is insufficient) | detection honours `temperature`, `max_turns`; sandboxed Read/Glob/Grep; direct detection transport alone exposes **mTLS** |
-| `openai` | OpenAI-compatible API | `OPENAI_API_KEY` | any compatible endpoint via `OPENAI_BASE_URL`; sandboxed Read/Glob/Grep |
-| `deepagents` | DeepAgents/LangGraph provider harness | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` or `OPENAI_API_KEY` | S10/S11 only; S10 fix mode has repo-confined writes, S11 is read-only; Bash denied |
-
-The `cli`/`sdk` rows describe detection. S11 maps both selectors to the
-read-only Claude Agent SDK Harness; S10 remains direct CLI for `via: cli` and
-delegates fix-mode Edit/Write to the Agent SDK for `via: sdk`.
-
-Swapping is config-only — no code change:
-
-```yaml
-models:
-  deepdive: {id: <model-id>, via: openai}
-  verify:   {id: <model-id>, via: sdk}
-```
-
-See [models.md](models.md) for the role→backend matrix.
-
----
-
-## 6. Optional context inputs
-
-The `inject` block points at optional files that enrich findings. Only the
-`*.example.*` templates ship; copy them to the real names referenced by the
-config (or point `inject.*` at your own paths):
-
-```bash
-cp inputs/cmdb.example.csv          inputs/cmdb.csv
-cp inputs/known_cves.example.json   inputs/known_cves.json
-cp inputs/design_controls.example.yaml inputs/design_controls.yaml
-```
-
-If a file is absent the pipeline still runs — the corresponding enrichment is
-simply skipped (e.g. without a CMDB export, base CVSS + OffensivePriority are
-still computed; only VulContextSeverity environmental scoring is skipped). The
-real-data filenames (`inputs/cmdb.csv`, `inputs/repos.csv`,
-`inputs/design_controls.yaml`, `inputs/known_cves.json`) are git-ignored, so
-they aren't committed by an ordinary `git add` — only the shipped
-`*.example.*` templates are tracked. (A `git add -f` can still force one in,
-so don't override the ignore for a file holding real internal data.)
-
-For batch scanning, see [repos-csv.md](repos-csv.md) and the worked
-example at `inputs/repos.example.csv`.
-
----
-
-## 7. Verifying the install
-
-```bash
-vvaharness --help
-vvaharness doctor
-vvaharness estimate --repo /path/to/some/repo
-```
-
-If `doctor` reports all configured backends present and reachable, you're ready
-to `vvaharness scan` (see [USER_GUIDE.md](USER_GUIDE.md)).

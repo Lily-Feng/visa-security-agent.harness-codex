@@ -26,9 +26,13 @@ Steps don't need to know which backend they're hitting — they pass the
 whole config node and the dispatcher unpacks it.
 """
 from __future__ import annotations
+
 from typing import Any
 
-from vvaharness.backends import claude_cli as cli, sdk, oai
+from vvaharness.backends import claude_cli as cli
+from vvaharness.backends import codex_cli as codex
+from vvaharness.backends import oai, sdk
+
 # Re-export so existing `from backends.claude_cli import parse_json_response, TOKENS`
 # call sites can switch to `from backends.llm import ...` uniformly.
 from vvaharness.backends.claude_cli import parse_json_response  # noqa: F401
@@ -77,7 +81,7 @@ def resolve(model_cfg: Any) -> tuple[str, str, dict]:
     return model_id, via, extras
 
 
-_BACKENDS = {"cli": cli, "sdk": sdk, "openai": oai}
+_BACKENDS = {"cli": cli, "codex": codex, "sdk": sdk, "openai": oai}
 
 
 def prompt(user_prompt: str, *, model: Any, **kw) -> str:
@@ -85,8 +89,10 @@ def prompt(user_prompt: str, *, model: Any, **kw) -> str:
     backend = _BACKENDS.get(via)
     if backend is None:
         raise ValueError(f"Unknown backend `via: {via}` for model {model_id}")
-    if via == "cli":
-        # CLI backend has no temperature/thinking flags; silently drop SDK-only kwargs.
+    if via in {"cli", "codex"}:
+        # CLI backends have no per-call temperature/thinking flags; silently
+        # drop API-backend-only kwargs. Codex reasoning effort is configured in
+        # the profile's top-level `codex:` block.
         kw.pop("temperature", None)
         kw.pop("thinking_budget", None)
         kw.pop("betas", None)
@@ -102,8 +108,24 @@ def agentic(user_prompt: str, *, model: Any, **kw) -> str:
     backend = _BACKENDS.get(via)
     if backend is None:
         raise ValueError(f"Unknown backend `via: {via}` for model {model_id}")
-    # `stream_cb` (live trace) is only implemented on the CLI backend; drop it
-    # for sdk/openai so passing it never raises a TypeError on those backends.
-    if via != "cli":
+    # `stream_cb` (live trace) is implemented by subprocess backends only; drop
+    # it for sdk/openai so passing it never raises a TypeError there.
+    if via not in {"cli", "codex"}:
         kw.pop("stream_cb", None)
     return backend.agentic(user_prompt, model=model_id, **kw)
+
+
+def aborted() -> bool:
+    """Whether either subprocess backend has been cooperatively aborted."""
+    return cli.aborted() or codex.aborted()
+
+
+def abort() -> int:
+    """Abort all in-flight subprocess backends; return processes signalled."""
+    return cli.abort() + codex.abort()
+
+
+def reset_abort() -> None:
+    """Reset process-global abort state between repositories/batch items."""
+    cli.reset_abort()
+    codex.reset_abort()

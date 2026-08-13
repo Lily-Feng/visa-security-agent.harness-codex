@@ -39,7 +39,7 @@ from vvaharness.util.prompts import EXCLUSION_RULES
 from vvaharness.report.cvss import score as cvss_score, rating as cvss_rating
 from vvaharness.report.redact import redact
 from vvaharness.util import errlog as _errlog
-from vvaharness.backends import claude_cli as cli
+from vvaharness.backends import llm as cli
 from vvaharness.backends.claude_cli import GuardrailBlocked
 from vvaharness.pipeline.callgraph_consumer import graph_view, qnodes_at
 from vvaharness.pipeline.stages.s1_preprocess import q_file

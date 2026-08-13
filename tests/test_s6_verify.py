@@ -25,10 +25,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from vvaharness.backends import claude_cli as cli
+from vvaharness.backends import llm
+from vvaharness.backends.claude_cli import GuardrailBlocked
 from vvaharness.models import ContextPackage, Finding, VulnClass
 from vvaharness.pipeline.stages import s6_verify
-from vvaharness.backends import claude_cli as cli
-from vvaharness.backends.claude_cli import GuardrailBlocked
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41,9 +42,9 @@ def _isolate():
     # path) may leave it set, which would poison _verify_one with
     # "aborted by user". Clear before and after every test. (errlog._path is
     # redirected by the shared tests/conftest.py fixture.)
-    cli.reset_abort()
+    llm.reset_abort()
     yield
-    cli.reset_abort()
+    llm.reset_abort()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

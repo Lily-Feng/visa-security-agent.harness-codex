@@ -47,7 +47,7 @@ from vvaharness.backends.llm import prompt, resolve
 from vvaharness.report.redact import redact_counts, redact, _luhn
 from vvaharness.util.json_extract import extract_json
 from vvaharness.util import errlog as _errlog
-from vvaharness.backends import claude_cli as cli
+from vvaharness.backends import llm as cli
 from vvaharness.backends.claude_cli import GuardrailBlocked
 from vvaharness.backends.sdk import _supports_temperature
 from vvaharness.util.prompts import (EXCLUSION_RULES, SELF_VERIFICATION,

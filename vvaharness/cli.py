@@ -373,17 +373,27 @@ def _setup(rest: list[str]) -> int:
         _install_agents()
     else:
         print("\n  AI agent driving this? Run `vvaharness setup --install-agents` "
-              "to drop the right instructions for your agent (Claude/Copilot/"
-              "Gemini) so it runs the tool instead of editing it.")
+              "to drop the right instructions for your agent (Codex/Claude/"
+              "Copilot/Gemini) so it runs the tool correctly.")
         print("  (Operating manual: AGENTS.md · capabilities: docs/SKILLS.md)")
     if n_blocking:
         print(f"\n  Not ready: fix the {n_blocking} blocking item(s) above, "
               f"then `vvaharness scan`.\n")
         return 1
     print("\n  Ready ✓  →  vvaharness scan --repo /path/to/target")
-    print("  ⚠ the shipped default profile runs remediation in fix mode, so `scan` EDITS "
-          "source files in the target repo.")
-    print("    For detection only (no code changes): vvaharness scan --repo … --stop-after s9\n")
+    try:
+        from vvaharness import config as config_mod
+        active_cfg = config_mod.load(cfg_path)
+        remediation_on = bool(getattr(
+            getattr(active_cfg, "step_remediate", None), "enabled", False))
+    except Exception:
+        remediation_on = True
+    if remediation_on:
+        print("  ⚠ the active profile runs remediation in fix mode, so `scan` EDITS "
+              "source files in the target repo.")
+        print("    For detection only (no code changes): vvaharness scan --repo … --stop-after s9\n")
+    else:
+        print("  ✓ the active profile has remediation disabled (detection only; no source edits).\n")
     return 0
 
 

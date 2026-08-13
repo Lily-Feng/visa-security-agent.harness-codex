@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import pytest
 
-from vvaharness.util import environment as env
-from vvaharness.util.environment import OK, WARN, FAIL
 from vvaharness import cli
 from vvaharness.remediation_agent import rule_paths
+from vvaharness.util import environment as env
+from vvaharness.util.environment import FAIL, OK, WARN
 
 
 def _clear_anthropic(monkeypatch):
@@ -199,7 +199,7 @@ def test_recommend_default_when_jwt_and_claude(monkeypatch):
     # CLI-first default profile (every role via: cli).
     monkeypatch.delenv("ANTHROPIC_SDK_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "eybc.def.ghi")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "eyJbc.def.ghi")
     monkeypatch.setattr(env.shutil, "which", lambda c: "/usr/bin/claude" if c == "claude" else None)
     prof, _ = env.recommend_profile()
     assert prof == "default"
@@ -216,6 +216,29 @@ def test_recommend_sdk_when_only_sdk_key(monkeypatch, tmp_path):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("ANTHROPIC_SDK_API_KEY", "sk-ant-x")
     assert env.recommend_profile()[0] == "sdk"
+
+
+def test_recommend_codex_when_native_login_ready(monkeypatch):
+    monkeypatch.setattr(
+        env.shutil, "which", lambda c: "/usr/bin/codex" if c == "codex" else None)
+    monkeypatch.setattr(env, "_codex_login_present", lambda: True)
+    prof, reason = env.recommend_profile()
+    assert prof == "codex"
+    assert "Codex CLI login" in reason
+
+
+def test_codex_profile_accepts_native_login_without_openai_key(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(
+        env.shutil, "which", lambda c: "/usr/bin/codex" if c == "codex" else None)
+    monkeypatch.setattr(env, "_codex_login_present", lambda: True)
+    cfg = tmp_path / "codex.yaml"
+    cfg.write_text("models:\n  deepdive: {id: gpt-test, via: codex}\n",
+                   encoding="utf-8")
+    checks = env.config_check(cfg)
+    cred = next(c for c in checks if c.name == "via:codex credential")
+    assert cred.status == OK
+    assert not any(c.name == "via:openai credential" for c in checks)
 
 
 def test_claude_agent_uses_claude_json_login(monkeypatch, tmp_path):

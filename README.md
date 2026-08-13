@@ -216,7 +216,8 @@ and [`docs/remediation.md`](docs/remediation.md) /
 
 - **Python ≥ 3.11**
 - LLM credentials for the profile you run. For `default.yaml`: Claude Code
-  login for S1–S9, and `ANTHROPIC_API_KEY` for S10 and S11.
+  login for S1–S9, and `ANTHROPIC_API_KEY` for S10 and S11. For `codex.yaml`:
+  a native `codex login` (including ChatGPT authentication), with no API key.
   For `sdk.yaml`: `ANTHROPIC_SDK_API_KEY`. For mixed/custom routing, provide
   credentials for each backend in use; see [Configure](#configure).
 - The `claude` CLI — required for S1–S9 in the default profile (`via: cli`);
@@ -250,8 +251,9 @@ Or install it as an isolated global command (no venv needed) on any OS:
 pipx install .
 ```
 
-Either way this installs one command: `vvaharness`. All three backend adapters
-(Anthropic SDK, Claude CLI, OpenAI-compatible) ship out of the box. The
+Either way this installs one command: `vvaharness`. Direct adapters for
+Anthropic SDK, Claude CLI, Codex CLI, and OpenAI-compatible endpoints ship out
+of the box; the DeepAgents harness powers supported post-scan roles. The
 Anthropic SDK and OpenAI backends need only an API key, but the **Claude CLI
 backend used by the default profile also requires the external `claude` CLI to
 be installed separately** (see [Requirements](#requirements)).
@@ -283,6 +285,9 @@ Which credential you need depends on the backend each role uses:
 - **`via: cli`** (the default profile) — use a Claude Code session instead of an
   API key: run `claude` then `/login`, or set `CLAUDE_CODE_OAUTH_TOKEN` (from
   `claude setup-token`).
+- **`via: codex`** — run `codex login`, then select `codex.yaml`. This reuses
+  native Codex/ChatGPT authentication through `codex exec`; no
+  `OPENAI_API_KEY` is required. Calls are ephemeral and read-only.
 - **`via: sdk`** — set `ANTHROPIC_SDK_API_KEY`. Behind a private gateway, also
   set `ANTHROPIC_SDK_BASE_URL` (plus `ANTHROPIC_SDK_CA_CERT` /
   `ANTHROPIC_SDK_CLIENT_CERT` for mTLS).
@@ -307,6 +312,18 @@ Anthropic SDK + OpenAI roles), copy `vvaharness/config/profiles/full.yaml` to
 
 For source→sink callgraph scanning, use the shipped `taint.yaml` profile:
 `vvaharness/config/profiles/taint.yaml`.
+
+For a native Codex detection run:
+
+```bash
+codex login
+vvaharness scan --repo /path/to/target \
+  --config vvaharness/config/profiles/codex.yaml
+```
+
+This runs S0–S9 with the standard Markdown, SARIF, error-log, checkpoint, and
+manifest artifact types. The profile disables S10 remediation and S11
+validation because the Codex transport is deliberately read-only.
 
 For a step-by-step walkthrough — picking a profile, config resolution order,
 secrets in `.env`, and copy-then-edit customization — see
@@ -356,7 +373,7 @@ thresholds, see [`docs/validation.md`](docs/validation.md) and
 
 ---
 
-## Use with an AI agent (Claude / Copilot / Gemini)
+## Use with an AI agent (Codex / Claude / Copilot / Gemini)
 
 ```bash
 vvaharness setup --install-agents

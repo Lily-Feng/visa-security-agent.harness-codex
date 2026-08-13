@@ -281,6 +281,7 @@ Each model role picks its own `{id, via}` in `config.yaml: models`:
 | `via:` | Transport | Auth | Tools |
 |---|---|---|---|
 | `cli` *(default profile)* | `claude` CLI subprocess | run `claude` then `/login` (or `CLAUDE_CODE_OAUTH_TOKEN` via `claude setup-token`) | Read/Glob/Grep (the only backend that *can* also run **Bash** — but no shipped profile grants it; add `- Bash` to a role's `allowed_tools` to enable) |
+| `codex` | `codex exec` subprocess | `codex login` (native ChatGPT or API-key login cached by Codex) | Ephemeral read-only S0–S9 repository inspection; no Bash/Edit/Write |
 | `sdk` | Anthropic Python SDK | `ANTHROPIC_SDK_API_KEY` | Read/Glob/Grep (sandboxed) — honours `temperature`, `max_turns` |
 | `openai` | OpenAI-compatible API | `OPENAI_API_KEY` | Read/Glob/Grep (sandboxed) |
 | `deepagents` | DeepAgents/LangGraph provider harness | Anthropic: `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; OpenAI: `OPENAI_API_KEY` | S10/S11 only; repo-confined writes in S10 fix mode, read-only in S11; Bash denied |
@@ -292,7 +293,7 @@ Agent SDK.
 
 ### Shipped profiles & how to switch (modes)
 
-Four ready profiles live in `vvaharness/config/profiles/`. Run
+Five ready profiles live in `vvaharness/config/profiles/`. Run
 `vvaharness setup`—its recommendation is a starting point based on detected
 credentials, not a guarantee that every post-scan role is ready. Re-run setup
 with the selected profile and resolve its warnings. Select a profile per run
@@ -302,6 +303,7 @@ in the working dir wins, else the packaged `default.yaml`.
 | Profile | Backend(s) | Use when… | Run |
 |---|---|---|---|
 | `default.yaml` | local S0; S1–S9 `via: cli`; S10/S11 `via: deepagents` (Anthropic) | you have Claude Code auth for S1–S9 plus `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` for S10/S11. The built-in default. | *(no flag)* |
+| `codex.yaml` | S0–S9 `via: codex`; S10/S11 disabled | you have a native Codex/ChatGPT login from `codex login`; no `OPENAI_API_KEY` needed | `--config vvaharness/config/profiles/codex.yaml` |
 | `sdk.yaml` | every role spelled `via: sdk`: Anthropic Python SDK for detection; Claude Agent SDK paths for S10 fix/S11; no Bash | you want s4 majority voting. `ANTHROPIC_SDK_API_KEY` covers S1–S10; S11 pins external `claude` and uses Claude login/OAuth or standard Anthropic auth. One standard credential can cover all stages via the sole-SDK fallback. | `--config vvaharness/config/profiles/sdk.yaml` |
 | `full.yaml` | mixed `cli`+`sdk`+`openai` | complete run: Claude CLI auth (also usable by S11), `ANTHROPIC_SDK_API_KEY` for SDK detection/S10, and `OPENAI_API_KEY`; standard Anthropic auth is an S11 alternative | `--config vvaharness/config/profiles/full.yaml` |
 | `taint.yaml` | S0 wrapper + S1–S9 `via: cli`; S10/S11 disabled | you want taint-first source→sink scanning; Claude Code login covers model stages, while shipped rules mode needs operator-supplied generated rule files for an S0 seed. | `--config vvaharness/config/profiles/taint.yaml` |
@@ -339,6 +341,7 @@ models:
   deepdive:   {id: claude-opus-4-8,  via: sdk}     # SDK on a public Opus
   verify:     {id: claude-sonnet-4-6, via: cli}    # ← flip one role to the CLI
   threatmodel: {id: gpt-4o,          via: openai}  # ← or to OpenAI
+  chain:       {id: gpt-5.6-terra,      via: codex}   # ← native Codex login
   # …autoexclude, preprocess, decompose, dedup, chain…
   validate:
     orchestrator: {id: gpt-5.5, via: deepagents, provider: openai}

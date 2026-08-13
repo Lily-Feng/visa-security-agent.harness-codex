@@ -25,9 +25,15 @@ import tempfile
 import time
 from collections.abc import Iterable
 from pathlib import Path
-from vvaharness.backends import sdk, oai, claude_cli as cli
-from vvaharness.backends.llm import (DEEPAGENTS_ROLES, POST_SCAN_ROLES,
-                                     resolve as resolve_model)
+
+from vvaharness.backends import claude_cli as cli
+from vvaharness.backends import codex_cli as codex
+from vvaharness.backends import oai, sdk
+from vvaharness.backends.llm import (
+    DEEPAGENTS_ROLES,
+    POST_SCAN_ROLES,
+    resolve as resolve_model,
+)
 from vvaharness.orchestrator.config_paths import _iter_model_roles, _resolve_against
 
 
@@ -93,6 +99,9 @@ def configure_backends(cfg, cfg_dir: Path) -> None:
             no_proxy=getattr(cli_cfg, "no_proxy", None) or None,
             effort=getattr(cli_cfg, "effort", None) or None,
         )
+    codex_cfg = getattr(cfg, "codex", None)
+    if codex_cfg is not None:
+        codex.configure(effort=getattr(codex_cfg, "effort", None) or None)
 
 
 def _reachable_despite_token_cap(err_msg: str) -> bool:
@@ -139,7 +148,8 @@ def check_backends(cfg) -> bool:
     """
     Verify whichever backend(s) the config actually uses:
       - any role with via:cli  → `claude` must be on PATH
-      - any role with via:sdk  → ANTHROPIC_SDK_API_KEY (or cfg.sdk.api_key) must be set
+      - any role with via:codex → `codex` on PATH with a valid native login
+      - any role with via:sdk   → ANTHROPIC_SDK_API_KEY (or cfg.sdk.api_key) must be set
     """
     model_roles = list(_iter_model_roles(cfg))
     vias = {resolve_model(m)[1] for _, m in model_roles}
@@ -165,6 +175,10 @@ def check_backends(cfg) -> bool:
         if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
             print("    CLAUDE_CODE_OAUTH_TOKEN present for unattended CLI auth ✓",
                   file=sys.stderr)
+
+    if "codex" in vias:
+        print("  [auth] codex: delegated to `codex login`; live probe verifies access",
+              file=sys.stderr)
 
     # Presence dump only for credentials required by active API backends.
     # via:sdk uses the Anthropic Python SDK and requires SDK/API credentials.
@@ -213,6 +227,20 @@ def check_backends(cfg) -> bool:
                 ok = False
         else:
             print("  [cli] claude found on PATH ✓", file=sys.stderr)
+
+    if "codex" in vias:
+        if not (shutil.which("codex") or shutil.which("codex.exe")):
+            print("ERROR: `codex` CLI not found on PATH (required by via:codex roles).",
+                  file=sys.stderr)
+            print("  Install: https://developers.openai.com/codex/cli/",
+                  file=sys.stderr)
+            ok = False
+        elif not codex.login_status():
+            print("ERROR: Codex CLI is installed but not logged in.", file=sys.stderr)
+            print("  Run: codex login", file=sys.stderr)
+            ok = False
+        else:
+            print("  [codex] CLI found and login ready ✓", file=sys.stderr)
 
     if "sdk" in vias:
         key = getattr(getattr(cfg, "sdk", None), "api_key", None) \
@@ -285,11 +313,12 @@ def check_backends(cfg) -> bool:
     # ANTHROPIC_BASE_URL) BEFORE the live probe — otherwise the request goes to
     # the public endpoint and (behind a corporate proxy) hangs to a 60s+ timeout
     # instead of giving the actionable fix. Fail fast with the exact remedy.
-    from vvaharness.util.environment import _gateway_check, FAIL as _FAIL
-    gw = _gateway_check()
-    if gw.status == _FAIL:
-        print(f"ERROR: {gw.detail}", file=sys.stderr)
-        return False
+    if vias & {"cli", "sdk"}:
+        from vvaharness.util.environment import _gateway_check, FAIL as _FAIL
+        gw = _gateway_check()
+        if gw.status == _FAIL:
+            print(f"ERROR: {gw.detail}", file=sys.stderr)
+            return False
     return probe_backends(cfg)
 
 

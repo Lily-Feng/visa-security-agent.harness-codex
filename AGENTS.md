@@ -13,31 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# AGENTS.md — How to operate vvaharness (for AI coding agents)
-
-You are running **vvaharness**, a *released* command-line security-scanning
-product. Your job is to **operate it**, not to develop or repair it.
-
-This file is the operating manual for AI agents (Claude Code, GitHub Copilot,
-Cursor, Codex, etc.). Read it fully before doing anything in this repo.
-
----
-
-## 🔴 The three rules (most important)
-
-1. **Do NOT modify the product's source to make a scan run.** Files under
-   `vvaharness/` are the shipped tool. If a scan won't start, that is an
-   environment problem to fix (below) or a bug to report — never a reason to
-   edit `claude_cli.py`, a stage, or any package file. Hand-edited source =
-   non-reproducible, unsupported results.
-2. **Do NOT hand-write config files.** Everything needed is in the shipped
-   profiles (`vvaharness/config/profiles/*.yaml`). Pick a profile with
-   `--config`; never create a bespoke `config-*.yaml` to work around an error.
-3. **When anything fails, run `vvaharness setup` (or `doctor`) and fix the
-   environment it points to** — then re-run the same command. Do not improvise.
-
-If the tool genuinely misbehaves after `setup` is green, report it as a bug
-(stack trace via `VVAHARNESS_DEBUG=1`). Don't patch around it.
 
 ---
 
@@ -81,6 +56,7 @@ the current probe does not exercise that Agent-SDK launcher.
 | You have… | Use | How |
 |---|---|---|
 | Claude Code auth + an Anthropic provider key | `default` | default — no flag |
+| Codex auth (`codex login`, including ChatGPT) | `codex` | `--config vvaharness/config/profiles/codex.yaml` |
 | Anthropic SDK/API credential(s) | `sdk` | `--config vvaharness/config/profiles/sdk.yaml` |
 | Multi-provider (Claude auth + Anthropic SDK + OpenAI) | `full` | `--config vvaharness/config/profiles/full.yaml` |
 | Claude Code auth, detection only; external rules for an S0 seed | `taint` | `--config vvaharness/config/profiles/taint.yaml` |
@@ -129,6 +105,9 @@ vvaharness scan --repo /path/to/target --application-id <id> [--config <profile>
 - A `run_manifest.json` (written in the current working directory, not under `security-scan/`) records models/config/timing for the run.
 - Findings are **triage candidates, not confirmed vulnerabilities** — say so
   when you summarize them.
+- The shipped `codex.yaml` profile runs S0–S9 detection and the standard
+  artifact writers through native `codex exec` authentication. It is
+  deliberately read-only and disables S10/S11.
 
 ## When a scan fails
 1. Read the one-line `✗ scan failed: …` message.
@@ -158,14 +137,3 @@ vvaharness scan --repo /path/to/target --application-id <id> [--config <profile>
   own validation artifacts — there is no Docker, and nothing is applied to the
   scanned repo. Re-runs are idempotent (already-`validated` DTOs are skipped;
   `validation_failed` / `needs_review` stay re-validatable).
-
-## Do / Don't (quick reference)
-| ✅ Do | ❌ Don't |
-|---|---|
-| `vvaharness setup` / `doctor` on any error | edit files under `vvaharness/` |
-| pick a shipped `--config` profile | hand-write a config-*.yaml |
-| set env vars / `.env` for creds & gateway | paste keys into config or source |
-| report bugs with `VVAHARNESS_DEBUG=1` | "fix" the tool to force a run |
-| invoke from outside the target with explicit `--config` | `cd` into the scanned repo then run |
-| use `via: sdk` or `via: openai` for untrusted targets | use `via: cli` against repos you didn't author |
-| re-run a failed scan clean | pass `--resume` against an untrusted repo |

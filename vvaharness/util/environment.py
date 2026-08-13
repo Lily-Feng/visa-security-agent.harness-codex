@@ -102,7 +102,7 @@ def tool_check(cmd: str, why: str, *, required: bool = False) -> Check:
 _AGENTS = [
     ("Claude Code", "claude", ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
                                "CLAUDE_CODE_OAUTH_TOKEN"), "via:cli"),
-    ("OpenAI Codex", "codex", ("OPENAI_API_KEY",), "via:openai"),
+    ("OpenAI Codex", "codex", (), "via:codex"),
     ("Gemini CLI", "gemini", ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "—"),
     ("Cursor Agent", "cursor-agent", (), "—"),
     ("GitHub Copilot CLI", "copilot", (), "via:cli"),
@@ -123,6 +123,12 @@ def _claude_code_login_present() -> bool:
     return bool(data.get("oauthAccount"))
 
 
+def _codex_login_present() -> bool:
+    """Ask the CLI itself; Codex auth may live in a keychain or auth.json."""
+    from vvaharness.backends.codex_cli import login_status
+    return login_status()
+
+
 def agent_checks() -> list[Check]:
     """Detect installed AI agents and whether they are ready to use.
     Presence only — never the key value."""
@@ -133,8 +139,12 @@ def agent_checks() -> list[Check]:
         if not path:
             out.append(Check(f"agent: {display}", WARN, "not installed"))
             continue
-        has_auth = (not keys) or any(_is_set(k) for k in keys) or (cmd == "claude" and oauth)
-        if not keys:
+        if cmd == "codex":
+            has_auth = _codex_login_present()
+        else:
+            has_auth = ((not keys) or any(_is_set(k) for k in keys)
+                        or (cmd == "claude" and oauth))
+        if not keys and cmd != "codex":
             keyinfo = "installed"
         else:
             keyinfo = "installed and logged in" if has_auth else "installed; login not detected"
@@ -268,6 +278,10 @@ def recommend_profile() -> tuple[str | None, str]:
     every enabled post-scan stage is ready; ``config_check`` reports those
     provider credentials separately.
     Returns (profile_name, reason)."""
+    # A native Codex login needs no API key and maps to the all-Codex profile.
+    if shutil.which("codex") and _codex_login_present():
+        return "codex", ("Codex CLI login detected — codex.yaml runs detection "
+                         "roles via `codex exec` using that login")
     # Prefer the default when Claude Code auth is available because its S1-S9
     # detection flow uses the CLI. S10/S11 have separate advisory readiness
     # checks and are skipped when their provider credentials are unavailable.
@@ -390,6 +404,18 @@ def config_check(cfg_path: str | Path) -> list[Check]:
         out.append(Check("via:openai credential", FAIL,
                          "OPENAI_API_KEY not set (required by this profile)",
                          required=True))
+    if "codex" in vias:
+        if not shutil.which("codex"):
+            out.append(Check("via:codex backend", FAIL,
+                             "`codex` CLI not on PATH (required by this profile)",
+                             required=True))
+        elif not _codex_login_present():
+            out.append(Check("via:codex credential", FAIL,
+                             "Codex login not detected — run `codex login`",
+                             required=True))
+        else:
+            out.append(Check("via:codex credential", OK,
+                             "Codex CLI login ready (credential value not read)"))
     if "cli" in vias and not shutil.which("claude"):
         out.append(Check("via:cli backend", FAIL,
                          "`claude` CLI not on PATH (required by this profile)",
@@ -436,6 +462,12 @@ def _backend_credential_ok(
         if _is_set("OPENAI_API_KEY"):
             return True, "OPENAI_API_KEY set"
         return False, "OPENAI_API_KEY not set"
+    if via == "codex":
+        if not shutil.which("codex"):
+            return False, "`codex` CLI not on PATH"
+        if not _codex_login_present():
+            return False, "Codex CLI not logged in"
+        return True, "Codex CLI login ready"
     if via == "deepagents":
         # Use explicit provider; fall back to name-based inference only when absent.
         is_openai = (provider == "openai") if provider else ("claude" not in model_id.lower())
@@ -546,7 +578,21 @@ def run_checks(cfg_path: str | Path) -> list[Check]:
     checks += agent_checks()
     checks += credential_checks()
     checks += dep_checks()
-    checks.append(tls_check())
+    # Anthropic endpoint TLS is irrelevant to a Codex-only/OpenAI-only profile.
+    # Keep the check for configs that actually launch Claude or the Anthropic
+    # SDK, and conservatively retain it when the config cannot be loaded.
+    needs_anthropic_tls = True
+    try:
+        from vvaharness import config as config_mod
+        from vvaharness.orchestrator.config_paths import _iter_model_roles
+        active = config_mod.load(cfg_path)
+        vias = {getattr(m, "via", "cli")
+                for _, m in _iter_model_roles(active)}
+        needs_anthropic_tls = bool(vias & {"cli", "sdk"})
+    except Exception:
+        pass
+    if needs_anthropic_tls:
+        checks.append(tls_check())
     checks.append(remediation_inputs_check())
     cfg_checks = config_check(cfg_path)
     if cfg_checks:
