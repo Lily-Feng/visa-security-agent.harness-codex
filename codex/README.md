@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for native Codex support.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,17 +16,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Codex-Only Direction
+# Native Codex Direction
 
-This fork's intended direction is to run VVAH with Codex as the only model and
-agent runtime. The upstream `via: openai` backend is not that integration: it
+This independently maintained project's Codex direction runs VVAH with Codex
+as the model and agent runtime. The upstream `via: openai` backend is not that
+integration: it
 calls an OpenAI-compatible API and requires `OPENAI_API_KEY`. A native Codex
 backend should instead use the locally authenticated Codex runtime and support
 both ChatGPT subscription authentication and Codex API-key authentication as
 provided by Codex itself.
 
-This folder is a design package. The native backend is not implemented yet.
-Until it is, setting `via: codex` in a VVAH profile will not work.
+The first milestone is implemented: the shipped `codex.yaml` profile runs
+read-only S0-S9 detection through `codex exec`. Report-only remediation, fix
+mode, and Codex-native validation remain future milestones.
 
 ## Desired user experience
 
@@ -82,4 +86,3 @@ coupled to the Claude Agent SDK and must be replaced or generalized separately.
   configuration, migration, tests, and acceptance criteria.
 - [EFFICIENCY-AND-SAFETY.md](EFFICIENCY-AND-SAFETY.md) defines context, token,
   process, concurrency, sandbox, prompt-injection, and observability controls.
-

@@ -1,4 +1,6 @@
 # Copyright 2026 Visa, Inc.
+# Modifications Copyright 2026 Lily Feng.
+# Modified by Lily Feng in 2026 for independent distribution metadata.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +20,6 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 try:
     # Single source of truth: the installed package metadata (pyproject `version`),
     # so the CLI banner can never drift from the released version again.
-    __version__ = _pkg_version("vvaharness")
+    __version__ = _pkg_version("codex-vulnerability-agentic-harness")
 except PackageNotFoundError:  # running from a source tree that isn't pip-installed
     __version__ = "1.2.0"

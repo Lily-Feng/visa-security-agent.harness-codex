@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for independent security guidance.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -136,4 +138,3 @@ malicious dependency/build activity, or loss of audit integrity.
 
 Do not continue invasive testing on a potentially compromised production
 system without incident-command authorization.
-

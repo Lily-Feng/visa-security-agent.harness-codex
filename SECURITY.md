@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for independent project governance.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +19,8 @@ limitations under the License.
 # Security Policies and Procedures
 
 This document outlines security procedures and general policies for the
-Visa Vulnerability Agentic Harness (`vvaharness`) project.
+independently maintained Codex Vulnerability Agentic Harness project. It is not
+affiliated with or endorsed by Visa Inc. or OpenAI.
 
 - [Reporting a Vulnerability](#reporting-a-vulnerability)
 - [Disclosure Policy](#disclosure-policy)
@@ -31,19 +34,19 @@ Thank you for improving the security of our software. We appreciate your
 efforts and responsible disclosure and will make every effort to acknowledge
 your report.
 
-Please report security vulnerabilities by emailing the security team at:
+Use GitHub's private vulnerability reporting for this repository:
 
-- **`vvaharness@visa.com`**
+- **https://github.com/Lily-Feng/codex-vulnerability-agentic-harness/security/advisories/new**
 
-For coordinated disclosure and additional reporting channels, see:
-
-- Visa Vulnerability Disclosure Program: https://usa.visa.com/about-visa/vulnerability-disclosure.html
+If private vulnerability reporting is temporarily unavailable, contact the
+maintainer through the contact methods on the
+[Lily-Feng GitHub profile](https://github.com/Lily-Feng) before sharing
+sensitive details.
 
 Please do **not** report security vulnerabilities through public GitHub issues.
 
-The security team will acknowledge your email and follow up with next steps
-in handling your report. We will keep you informed of progress toward a fix
-and full announcement, and may ask for additional information or guidance.
+The maintainer will acknowledge the report and coordinate triage, remediation,
+and disclosure. Additional information or validation may be requested.
 
 When reporting, please include as much of the following as you can to help us
 triage quickly:
@@ -63,9 +66,8 @@ that maintains the affected component.
 
 ## Disclosure Policy
 
-When the security team receives a vulnerability report, it is assigned to a
-primary handler. This person coordinates the fix and release process, involving
-the following steps:
+When the project receives a vulnerability report, the maintainer coordinates
+the fix and release process, involving the following steps:
 
 - Confirm the problem and determine the affected versions.
 - Audit code to find any potential similar problems.

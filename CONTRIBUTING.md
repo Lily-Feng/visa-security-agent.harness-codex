@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for independent project governance.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,37 +18,39 @@ limitations under the License.
 
 # Contributing
 
-Thank you for your interest in `vvaharness`. We welcome feedback, ideas, and
-bug reports from anyone using the tool.
+Thank you for contributing to Codex Vulnerability Agentic Harness. This is an
+independently maintained derivative of Visa Vulnerability Agentic Harness and
+is not affiliated with or endorsed by Visa Inc. or OpenAI.
 
-## Current status
+## Ways to contribute
 
-We are not accepting pull requests at this time. The project is in active
-development and we expect to revisit this as the project matures.
+- Report reproducible bugs through GitHub Issues.
+- Propose focused improvements through pull requests.
+- Improve tests, documentation, platform support, and security guidance.
+- Discuss substantial design changes in an issue before investing in a large
+  implementation.
 
-We are excited about where `vvaharness` is heading and look forward to building
-it with the community in the next phase. Your patience, your feedback, and your
-interest at this early stage mean a great deal to the team.
+## Development workflow
 
-— The `vvaharness` team
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+pytest
+```
 
-## How you can help
+Keep changes focused, add or update tests, and do not commit credentials,
+private scan targets, generated findings, or proprietary rule packs.
 
-Even without open contributions, there are meaningful ways to get involved:
+## Licensing contributions
 
-- **Report bugs.** If something isn't working as expected, let us know. Clear
-  reproduction steps and environment details go a long way.
-- **Share feedback.** If you have ideas for improving the tool — new features,
-  workflow improvements, configuration options — we'd love to hear them.
-- **Improve documentation.** If something in the docs is unclear or missing,
-  flag it. Good documentation helps everyone.
-
-## Getting in touch
-
-Reach out to the maintainers at **`vvaharness@visa.com`**. We read everything
-and will follow up as bandwidth allows.
+Unless you explicitly state otherwise, contributions intentionally submitted
+to this repository are provided under the Apache License, Version 2.0, in line
+with section 5 of that license. You represent that you have the right to submit
+the contribution. Preserve applicable upstream copyright and attribution
+notices, and add a prominent modification notice when changing derived files.
 
 ## Security issues
 
-Please do **not** report security vulnerabilities through public channels. See
-[`SECURITY.md`](SECURITY.md) for the responsible disclosure process.
+Do not disclose vulnerabilities in public issues. Follow
+[`SECURITY.md`](SECURITY.md) for private reporting instructions.

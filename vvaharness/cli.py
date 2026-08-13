@@ -1,4 +1,6 @@
 # Copyright 2026 Visa, Inc.
+# Modifications Copyright 2026 Lily Feng.
+# Modified by Lily Feng in 2026 for native Codex support.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -194,7 +196,10 @@ def _check_python() -> str | None:
     bare source tree)."""
     try:
         from importlib.metadata import metadata
-        req = metadata("vvaharness").get("Requires-Python") or ""
+        req = (
+            metadata("codex-vulnerability-agentic-harness").get("Requires-Python")
+            or ""
+        )
     except Exception:
         return None
     import re

@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for native Codex support.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +21,7 @@ limitations under the License.
 ## Goal
 
 Add a `via: codex` transport that preserves VVAH's stage contracts while using
-the authenticated local Codex runtime. The fork should be able to complete
+the authenticated local Codex runtime. The project should be able to complete
 S1–S9 without an Anthropic dependency or an OpenAI Platform API key when the
 operator is already signed in to Codex with ChatGPT.
 
@@ -265,4 +267,3 @@ security-architect and penetration-tester separation, but do not claim
 independence when both personas use the same model/runtime. Record that
 limitation in validation output and require deterministic tests alongside the
 model verdict.
-

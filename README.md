@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for independent Codex maintenance.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,17 +16,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Visa Vulnerability Agentic Harness — Agentic SAST Pipeline
+# Codex Vulnerability Agentic Harness — Agentic SAST Pipeline
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue.svg)
 ![Version](https://img.shields.io/badge/version-1.2.0-informational.svg)
 ![Output](https://img.shields.io/badge/output-Markdown%20%2B%20SARIF%202.1.0-green.svg)
 
-VVAH is Visa's open-source harness for autonomous vulnerability discovery,
-remediation, and validation using frontier AI models, built on learnings from
-[Project Glasswing](https://www.anthropic.com/glasswing) (Anthropic's
-initiative for AI-assisted vulnerability research).
+Codex Vulnerability Agentic Harness is an independently maintained, Codex-first
+derivative of Visa's open-source
+[Visa Vulnerability Agentic Harness](https://github.com/visa/visa-vulnerability-agentic-harness).
+It preserves the upstream Git history and the `vvaharness` Python module and
+CLI names for compatibility while adding native `codex login` authentication
+and a read-only Codex detection profile.
+
+> **Independent project.** This project is maintained by Lily Feng and is not
+> affiliated with or endorsed by Visa Inc. or OpenAI. Visa and Codex are used
+> only to identify the upstream project and the supported integration.
 
 VVAH runs as a four-phase, eleven-stage pipeline from code ingest to validated
 fix (with an optional Stage 0 static seed used by the taint-first profile):
@@ -55,9 +63,9 @@ providers via a vendor-neutral abstraction layer. No single provider is a hard
 dependency. See [docs/models.md](docs/models.md) for the full model/backend
 matrix.
 
-For setup, see [`docs/SETUP_GUIDE.md`](docs/SETUP_GUIDE.md). This repository is
-not currently accepting external code contributions; see
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for details.
+For setup, see [`docs/SETUP_GUIDE.md`](docs/SETUP_GUIDE.md). Contributions are
+welcome; see [`CONTRIBUTING.md`](CONTRIBUTING.md). For upstream provenance and
+the synchronization policy, see [`UPSTREAM.md`](UPSTREAM.md).
 
 > **Authorized use only.** Run scans only against code you own or have explicit
 > permission to test. Findings and fixes are LLM-generated triage candidates
@@ -74,7 +82,7 @@ not currently accepting external code contributions; see
 [remediation.md](docs/remediation.md) · [validation.md](docs/validation.md) ·
 [Project Glasswing white paper](https://corporate.visa.com/content/dam/VCOM/corporate/visa-perspectives/security-and-trust/documents/project-glasswing.pdf) — technical background.
 
-**Fork companion guides:**
+**Project companion guides:**
 [Enterprise Security Companion](enterprise-security/README.md) — host, runtime,
 cloud, identity, supply-chain, detection, response, and post-scan assurance ·
 [Codex-Only Direction](codex/README.md) — native Codex backend plan,
@@ -466,7 +474,8 @@ not open security issues in a public tracker.
 ## License
 
 Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE) and
-[NOTICE](NOTICE). Copyright 2026 Visa, Inc.
+[NOTICE](NOTICE). Original work copyright 2026 Visa, Inc.; independent
+modifications copyright 2026 Lily Feng.
 
 Third-party dependencies are installed from PyPI at install time (not bundled
 in this repository); their licenses are inventoried in

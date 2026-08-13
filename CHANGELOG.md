@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for independent Codex maintenance.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,6 +17,23 @@ limitations under the License.
 -->
 
 # Changelog
+
+## Unreleased — independent Codex project
+
+### Added
+
+- Native `via: codex` transport using the operator's existing `codex login`.
+- Read-only `codex.yaml` detection profile for S0-S9.
+- Independent upstream-provenance and contribution policies.
+
+### Changed
+
+- Project branding and Python distribution metadata now identify the
+  independently maintained Codex derivative.
+- Visa remains a read-only upstream reference with its original Git history,
+  license, copyright, and `NOTICE` attribution preserved.
+- Maintainer, contribution, conduct, and vulnerability-reporting guidance now
+  belongs to the independent repository rather than Visa.
 
 ## [1.2.0] — 2026-08-04
 

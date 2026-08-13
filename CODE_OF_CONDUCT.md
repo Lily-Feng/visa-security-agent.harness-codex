@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for independent project governance.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +20,7 @@ limitations under the License.
 
 ## Our Pledge
 
-We as contributors and maintainers of the Visa Vulnerability Agentic Harness
+We as contributors and maintainers of Codex Vulnerability Agentic Harness
 (`vvaharness`) pledge to make participation in this project a respectful and
 productive experience for everyone.
 
@@ -57,9 +59,8 @@ channels.
 
 ## Enforcement
 
-Instances of unacceptable behavior may be reported to the project team at:
-
-- **`vvaharness@visa.com`**
+Instances of unacceptable behavior may be reported privately using the contact
+methods on the [maintainer's GitHub profile](https://github.com/Lily-Feng).
 
 All reports will be reviewed and investigated promptly and fairly. The project
 team is obligated to maintain confidentiality with respect to the reporter.

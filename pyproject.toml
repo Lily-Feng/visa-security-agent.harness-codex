@@ -1,4 +1,6 @@
 # Copyright 2026 Visa, Inc.
+# Modifications Copyright 2026 Lily Feng.
+# Modified by Lily Feng in 2026 for independent Codex maintenance.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,9 +19,9 @@ requires = ["setuptools>=82.0.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vvaharness"
+name = "codex-vulnerability-agentic-harness"
 version = "1.2.0"
-description = "Visa's open-source harness for autonomous vulnerability discovery and validation, using frontier AI models"
+description = "Independently maintained Codex-first agentic vulnerability discovery harness"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -44,6 +46,12 @@ dependencies = [
     "langchain-openai>=0.3.0",
     "langgraph>=0.3.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Lily-Feng/codex-vulnerability-agentic-harness"
+Source = "https://github.com/Lily-Feng/codex-vulnerability-agentic-harness"
+Issues = "https://github.com/Lily-Feng/codex-vulnerability-agentic-harness/issues"
+Upstream = "https://github.com/visa/visa-vulnerability-agentic-harness"
 
 [project.optional-dependencies]
 # Dev tooling: `pip install '.[dev]'` to run the test suite + the static

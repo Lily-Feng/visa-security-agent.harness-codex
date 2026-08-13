@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for independent security guidance.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -141,4 +143,3 @@ Runtime evidence can change a VVAH finding in either direction:
 
 The final assessment should state both source conclusions and deployed-state
 conclusions, including uncertainty and deferred scope.
-

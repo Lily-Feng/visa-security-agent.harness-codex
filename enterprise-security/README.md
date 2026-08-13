@@ -1,5 +1,7 @@
 <!--
 Copyright 2026 Visa, Inc.
+Modifications Copyright 2026 Lily Feng.
+Modified by Lily Feng in 2026 for independent security guidance.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -182,4 +184,3 @@ answer all of the following:
 
 If any answer is unknown, record it as an explicit gap rather than treating an
 absence of scanner findings as assurance.
-

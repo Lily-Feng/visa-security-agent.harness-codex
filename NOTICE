@@ -2,6 +2,16 @@ vvaharness
 
 Copyright 2026 Visa, Inc.
 
+Independent Codex adaptation and modifications:
+Copyright 2026 Lily Feng.
+
+This distribution is derived from Visa Vulnerability Agentic Harness:
+https://github.com/visa/visa-vulnerability-agentic-harness
+
+The independent project is not affiliated with or endorsed by Visa Inc. or
+OpenAI. Visa and Codex are referenced only to identify the upstream project and
+the supported integration.
+
 This product is licensed under the Apache License, Version 2.0 (the
 "License"); you may not use this product except in compliance with the
 License. You may obtain a copy of the License at:
