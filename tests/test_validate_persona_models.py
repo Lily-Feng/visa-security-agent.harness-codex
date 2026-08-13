@@ -15,15 +15,14 @@
 """Tests for per-persona configurable models in the s11 validator.
 
 Covers the full chain: profile models role -> _export_persona_models (env) ->
-load_config (ClaudeConfig) -> _persona_overrides -> load_agents override ->
+load_config (AgentConfig) -> _persona_overrides -> load_agents override ->
 SubagentDefinition.model -> SDK AgentDefinition.model. Unset persona -> inherit.
 """
 import os
 from types import SimpleNamespace
 
-from vvaharness.validation.backends.claude.options import _to_agent_definition
-from vvaharness.validation.backends.contract.subagents import SubagentDefinition
-from vvaharness.validation.cli._model import _export_persona_models
+from vvaharness.backends.harness.claude.options import _to_agent_definition
+from vvaharness.backends.harness.contract.subagents import SubagentDefinition
 from vvaharness.validation.config import load_config
 from vvaharness.validation.constants.artifacts import (
     ENV_CROSS_REPO_ANALYZER_MODEL,
@@ -54,7 +53,7 @@ def test_no_overrides_all_inherit() -> None:
 
 
 # ---------------------------------------------------------------------------
-# env-bridge -> ClaudeConfig
+# env-bridge -> AgentConfig
 # ---------------------------------------------------------------------------
 
 
@@ -63,9 +62,9 @@ def test_env_bridge_to_claude_config(monkeypatch) -> None:
     monkeypatch.delenv(ENV_PENETRATION_TESTER_MODEL, raising=False)
     monkeypatch.setenv(ENV_CROSS_REPO_ANALYZER_MODEL, "claude-sonnet-4-6")
     c = load_config()
-    assert c.claude.security_architect_model == "claude-opus-4-8"
-    assert c.claude.penetration_tester_model is None              # unset -> inherit
-    assert c.claude.cross_repo_analyzer_model == "claude-sonnet-4-6"
+    assert c.agent.security_architect_model == "claude-opus-4-8"
+    assert c.agent.penetration_tester_model is None              # unset -> inherit
+    assert c.agent.cross_repo_analyzer_model == "claude-sonnet-4-6"
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +73,7 @@ def test_env_bridge_to_claude_config(monkeypatch) -> None:
 
 
 def test_persona_overrides_omits_unset() -> None:
-    cfg = SimpleNamespace(claude=SimpleNamespace(
+    cfg = SimpleNamespace(agent=SimpleNamespace(
         security_architect_model="claude-opus-4-8",
         penetration_tester_model=None,
         cross_repo_analyzer_model="claude-sonnet-4-6",
@@ -86,21 +85,38 @@ def test_persona_overrides_omits_unset() -> None:
 
 
 # ---------------------------------------------------------------------------
-# _export_persona_models (profile role -> env)
+# _apply_model_env -> overrides (persona models go through overrides, not env)
 # ---------------------------------------------------------------------------
 
 
-def test_export_present_role_sets_env(monkeypatch) -> None:
-    monkeypatch.delenv(ENV_SECURITY_ARCHITECT_MODEL, raising=False)
-    cfg = SimpleNamespace(models=SimpleNamespace(validate_security_architect="claude-opus-4-8"))
-    _export_persona_models(cfg)
-    assert os.environ.get(ENV_SECURITY_ARCHITECT_MODEL) == "claude-opus-4-8"
+def test_persona_model_in_overrides(tmp_path) -> None:
+    from vvaharness.validation.cli._model import _apply_model_env
+    cfg_path = tmp_path / "p.yaml"
+    cfg_path.write_text(
+        "models:\n"
+        "  validate:\n"
+        "    orchestrator: {id: gpt-5.5, via: deepagents}\n"
+        "    security_architect: {id: claude-opus-4-8}\n"
+        "step_validate:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    rc, overrides = _apply_model_env(str(cfg_path))
+    assert rc == 0
+    assert overrides["security_architect_model"] == "claude-opus-4-8"
 
 
-def test_export_absent_role_leaves_env_unset(monkeypatch) -> None:
-    monkeypatch.delenv(ENV_PENETRATION_TESTER_MODEL, raising=False)
-    _export_persona_models(SimpleNamespace(models=SimpleNamespace()))
-    assert ENV_PENETRATION_TESTER_MODEL not in os.environ
+def test_absent_persona_role_not_in_overrides(tmp_path) -> None:
+    from vvaharness.validation.cli._model import _apply_model_env
+    cfg_path = tmp_path / "p.yaml"
+    cfg_path.write_text(
+        "models:\n  validate:\n    orchestrator: {id: gpt-5.5, via: deepagents}\n"
+        "step_validate:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    rc, overrides = _apply_model_env(str(cfg_path))
+    assert rc == 0
+    assert "security_architect_model" not in overrides
+    assert "penetration_tester_model" not in overrides
 
 
 # ---------------------------------------------------------------------------

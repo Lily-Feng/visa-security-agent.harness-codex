@@ -44,14 +44,15 @@ __all__ = [
 
 
 def _parse_gates(raw: list[Mapping[str, object]]) -> list[RawCriterion]:
-    return [parse_raw_criterion(g, FIX_CONFIG.criterion_name_field) for g in raw]
+    return [parse_raw_criterion(gate, FIX_CONFIG.criterion_name_field) for gate in raw]
 
 
 def _has_critical_failure(parsed: list[RawCriterion]) -> bool:
     """True when a critical gate is not clean (fail or partial) — the verdict is capped."""
     return any(
-        c.name in FIX_CONFIG.critical_criteria and c.status in _CRITICAL_NOT_CLEAN
-        for c in parsed
+        criterion.name in FIX_CONFIG.critical_criteria
+        and criterion.status in _CRITICAL_NOT_CLEAN
+        for criterion in parsed
     )
 
 
@@ -77,17 +78,23 @@ def derive_merge_readiness(score: ValidationScore) -> MergeReadiness:
     return MergeReadiness.NOT_READY
 
 
+_VALID_GATE_NAMES = frozenset(gate.value for gate in GateName)
+
+
 def _build_gate_results(parsed: list[RawCriterion]) -> list[GateResult]:
+    # Skip unrecognized gate names: a hallucinated name already forces
+    # UNVERIFIABLE in the engine, and GateName(<unknown>) would raise here.
     return [
         GateResult(
-            gate=GateName(r.name),
-            status=GateStatus.parse(r.status),
-            summary=r.summary,
+            gate=GateName(criterion.name),
+            status=GateStatus.parse(criterion.status),
+            summary=criterion.summary,
             evidence=[
-                EvidenceAnchor(file=e.file, line=e.line, snippet=e.snippet)
-                for e in r.evidence
+                EvidenceAnchor(file=anchor.file, line=anchor.line, snippet=anchor.snippet)
+                for anchor in criterion.evidence
             ],
-            details=r.details,
+            details=criterion.details,
         )
-        for r in parsed
+        for criterion in parsed
+        if criterion.name in _VALID_GATE_NAMES
     ]

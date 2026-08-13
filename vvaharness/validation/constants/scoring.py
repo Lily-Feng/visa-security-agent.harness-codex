@@ -29,12 +29,6 @@ GATE_WEIGHTS: dict[str, float] = {
 THRESHOLD_FIXED = 0.80
 THRESHOLD_PARTIAL = 0.50
 
-# Minimum active (non-skip) gate weight that must be evaluated for a verdict to be
-# trustworthy. Below this, the engine returns UNVERIFIABLE rather than scoring on too
-# little coverage. 0.50 is chosen so the cross-repo by-design 2-skip clean fix (active
-# weight 0.6767) still scores, but a lone passing gate (0.43) does not.
-COVERAGE_FLOOR: float = 0.50
-
 # --- Shared ---
 
 # SKIP is weight-neutral: a skipped gate is treated as unevaluated and dropped from the

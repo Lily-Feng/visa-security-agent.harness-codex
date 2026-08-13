@@ -24,6 +24,11 @@ Per target, under `<target>/security-scan/`:
 - `<module>_<ts>_report.sarif`
 - `<module>_<ts>_errors.jsonl` (only written if a recoverable error was logged; absent on a clean run)
 
+Every scan also writes `run_manifest.json` in the **current working directory**
+(not under `security-scan/`). It records the tool version, detection roles,
+config/overlay hashes, target git SHA, arguments, outcome, and timing. Batch
+mode additionally writes `<workspace>/batch_summary.md`.
+
 Remediation artifacts live separately, under
 `<repo>/security-remediation/<NN_slug>/` (written by the `remediate` command).
 The `validate` command updates each finding's DTO in place:
@@ -33,14 +38,18 @@ The `validate` command updates each finding's DTO in place:
   `validated` (fix passed), `validation_failed` (fix did not pass;
   re-validatable), or `needs_review` (session could not produce a verdict)
 - `validation_report.json` — the agentic panel's per-DTO findings
-- `synthesized_gates.json` — the weighted gate scores behind the verdict
+- `synthesized_gates.json` — qualitative consensus gate outcomes; host code
+  applies the configured weights to compute the score and verdict
 
-`validation_report.json` and `synthesized_gates.json` are *ephemeral*: they are
-written to the per-finding staging workspace under
+`validation_report.json` and `synthesized_gates.json` are *ephemeral*: agents
+return structured output and host code writes these files to the per-finding
+staging workspace under
 `<repo>/security-remediation/validation/<finding_id>/`, folded into the DTO's
 `validation` block, and then the workspace is deleted after each finding. Only
-`remediate_report.json` (plus the redacted `validation_session_*.jsonl`
-transcript persisted beside it) survives under `<NN_slug>/`.
+`remediate_report.json` survives under `<NN_slug>/`. When a source session log
+is available and redaction/persistence succeeds, a redacted
+`validation_session_*.jsonl` transcript is also retained beside it; transcript
+persistence is best-effort.
 
 Checkpoints in the SQLite state DB at `$VVAHARNESS_STATE_DIR/vvaharness.db`
 (default `~/.vvaharness/state/vvaharness.db`; run `vvaharness gc` or delete
@@ -110,10 +119,11 @@ Run-level `properties` always carries `applicationId`; `applicationName` and
 application (i.e. CMDB enrichment ran). The SARIF `tool.driver.name` is
 `"Agentic SAST"`. `tool.driver.rules[]` catalogs every emitted `ruleId`, and
 `tool.driver.supportedTaxonomies` references the CWE taxonomy (by a stable guid)
-so each result's `taxa[]` resolves. When the scan was degraded (deep-dive chunks
-failed, or the exploit-chain pass could not be computed) the run carries an
-`invocations[]` entry with `executionSuccessful=false` and per-stage
-`toolExecutionNotifications`. `executionSuccessful=false` is set only when the exploit-chain pass falls back (the degraded banner); deep-dive chunk failures emit `toolExecutionNotifications` (and the markdown Scan Health section) but leave `executionSuccessful=true`. A clean run reports `executionSuccessful=true` with no notifications.
+so each result's `taxa[]` resolves. The run carries one `invocations[]` entry.
+If exploit-chain analysis falls back to an unranked report,
+`executionSuccessful=false`; deep-dive chunk failures and other recoverable
+stage errors instead add `toolExecutionNotifications` while leaving that flag
+true. A clean run reports `executionSuccessful=true` with no notifications.
 
 ### Scan Health (markdown)
 

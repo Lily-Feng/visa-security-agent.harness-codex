@@ -49,37 +49,47 @@ def test_missing_touched_path_refused(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_persona_openai_endpoint_aborts(monkeypatch, capsys) -> None:
+def test_persona_openai_endpoint_accepted_for_deepagents(tmp_path, capsys) -> None:
     from vvaharness.validation.cli import _model
 
     def fake_resolve(spec):
         sid = spec if isinstance(spec, str) else spec.get("id", "")
         return (sid, "openai" if "gpt" in sid else "cli", {})
 
-    monkeypatch.setattr(_model.llm, "resolve", fake_resolve)
-    cfg = SimpleNamespace(models=SimpleNamespace(
-        validate_security_architect={"id": "gpt-5.5"},
-        validate_penetration_tester="claude-sonnet-4-6",
-        validate_cross_repo_analyzer="claude-sonnet-4-6",
-    ))
-    rc = _model._export_persona_models(cfg)
+    cfg_path = tmp_path / "p.yaml"
+    cfg_path.write_text(
+        "models:\n"
+        "  validate:\n"
+        "    orchestrator: {id: claude-sonnet-4-6, via: sdk}\n"
+        "    security_architect: {id: gpt-5.5}\n"
+        "    penetration_tester: {id: claude-sonnet-4-6}\n"
+        "step_validate:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    rc, overrides = _model._apply_model_env(str(cfg_path))
     out = capsys.readouterr().err
-    assert rc == 2
-    assert "not on an Anthropic-compatible endpoint" in out
-    assert "validate_security_architect" in out and "gpt-5.5" in out
+    assert rc == 0
+    assert "security_architect_model" in overrides
+    assert "not on an Anthropic-compatible endpoint" not in out
 
 
-def test_persona_all_anthropic_ok(monkeypatch) -> None:
-    from vvaharness.validation.cli import _model
-
-    monkeypatch.setattr(_model.llm, "resolve", lambda spec: (spec, "cli", {}))
-    monkeypatch.setattr(_model, "set_env", lambda *a, **k: None)
-    cfg = SimpleNamespace(models=SimpleNamespace(
-        validate_security_architect="claude-opus-4-8",
-        validate_penetration_tester="claude-sonnet-4-6",
-        validate_cross_repo_analyzer="claude-sonnet-4-6",
-    ))
-    assert _model._export_persona_models(cfg) == 0
+def test_persona_all_anthropic_ok(tmp_path) -> None:
+    from vvaharness.validation.cli._model import _apply_model_env
+    cfg_path = tmp_path / "p.yaml"
+    cfg_path.write_text(
+        "models:\n"
+        "  validate:\n"
+        "    orchestrator: {id: claude-sonnet-4-6, via: sdk}\n"
+        "    security_architect: {id: claude-opus-4-8}\n"
+        "    penetration_tester: {id: claude-sonnet-4-6}\n"
+        "    cross_repo_analyzer: {id: claude-sonnet-4-6}\n"
+        "step_validate:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    rc, overrides = _apply_model_env(str(cfg_path))
+    assert rc == 0
+    assert overrides.get("security_architect_model") == "claude-opus-4-8"
+    assert overrides.get("penetration_tester_model") == "claude-sonnet-4-6"
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,9 @@ mechanically:
   - hallucinated file paths not present in the repo inventory
   - s4 confidence below step5_prefilter.min_pre_confidence (legacy: step6_verify.min_pre_confidence)
   - missing source_ref/sink_ref when step5_prefilter.require_evidence is on (legacy: step6_verify.require_evidence)
+    — this gate judges each finding's OWN refs; AST/seed backfill runs only on
+    survivors afterwards, so it decorates kept findings but never satisfies the
+    gate for a finding that arrived without evidence
   - trivial dups: same file + vuln_class within step7_dedup.line_tolerance
   - SEMANTIC dups (one LLM call) when ≥ step7_dedup.pre_verify_threshold
     findings survive the gates above — collapsing root-cause duplicates here
@@ -34,10 +37,18 @@ call is one cheap dedup-model invocation, both re-run against the loaded s4
 checkpoint on --resume.
 """
 from __future__ import annotations
+import logging
 import re
 import sys
 
+log = logging.getLogger(__name__)
+
 from vvaharness.models import ContextPackage, Finding, DroppedFinding, VulnClass
+from vvaharness.pipeline.callgraph_consumer import (
+    best_source_from_seed,
+    entry_anchor_lines,
+    seed_paths_by_file,
+)
 from . import s7_dedup
 
 
@@ -93,14 +104,66 @@ def _gate(cfg, key: str, default):
     return default
 
 
+def _ast_backfill_evidence(f: Finding,
+                           entry_anchors: dict[str, list[int]],
+                           seed_idx: dict[str, list[list[str]]]) -> tuple[Finding, bool]:
+    """Backfill missing source_ref/sink_ref using AST/callgraph/seed paths.
+
+    This improves evidence completeness for true findings when one side of the
+    flow was omitted by s4 output formatting, without introducing model calls.
+    """
+    src = (f.source_ref or "").strip()
+    sink = (f.sink_ref or "").strip()
+    changed = False
+    backfilled: list[str] = []
+
+    if not sink:
+        sink = f"{f.file}:{max(1, int(f.line_start))}"
+        changed = True
+        backfilled.append("sink_ref")
+
+    if not src:
+        if f.vuln_class == VulnClass.INFO_LEAK:
+            src = sink
+            changed = True
+            backfilled.append("source_ref")
+        else:
+            anchors = entry_anchors.get(f.file, ())
+            if anchors:
+                best = min(anchors, key=lambda ln: abs(ln - int(f.line_start)))
+                src = f"{f.file}:{best}"
+                changed = True
+                backfilled.append("source_ref")
+            else:
+                seed_src = best_source_from_seed(seed_idx.get(f.file, ()))
+                if seed_src:
+                    src = seed_src
+                    changed = True
+                    backfilled.append("source_ref")
+
+    if not changed:
+        return f, False
+
+    return f.model_copy(update={
+        "source_ref": src or None,
+        "sink_ref": sink or None,
+        "backfilled_refs": sorted(set(f.backfilled_refs) | set(backfilled)),
+    }), True
+
+
 def run(findings: list[Finding], ctx: ContextPackage, cfg
         ) -> tuple[list[Finding], list[DroppedFinding]]:
+    log.info("s5/prefilter: starting pre-filter - findings=%d", len(findings))
     min_conf = _gate(cfg, "min_pre_confidence", 0.0) or 0.0
     require_evidence = _gate(cfg, "require_evidence", False)
+    ast_backfill = bool(_gate(cfg, "ast_backfill_evidence", True))
 
     valid_files = set(ctx.all_files) if ctx.all_files else None
     keep: list[Finding] = []
     dropped: list[DroppedFinding] = []
+    backfilled = 0
+    entry_anchors = entry_anchor_lines(ctx) if ast_backfill else {}
+    seed_idx = seed_paths_by_file(ctx.seed_taint_paths) if ast_backfill else {}
 
     def _drop(f: Finding, reason: str, detail: str) -> None:
         dropped.append(DroppedFinding(
@@ -120,9 +183,16 @@ def run(findings: list[Finding], ctx: ContextPackage, cfg
                   f"s4 confidence {f.confidence:.2f} < gate {min_conf:.2f}")
         elif require_evidence and not ((f.source_ref or "").strip()
                                        and (f.sink_ref or "").strip()):
+            # Precision-first: the require_evidence gate judges the finding's
+            # OWN source/sink refs. Backfill runs only on the keep-path below,
+            # so it can never manufacture the evidence this gate demands.
             _drop(f, "UNCONFIRMED",
                   "missing source_ref/sink_ref — data flow unproven")
         else:
+            if ast_backfill:
+                f, changed = _ast_backfill_evidence(f, entry_anchors, seed_idx)
+                if changed:
+                    backfilled += 1
             keep.append(f)
             if secret_class:
                 kept_in_test.append(f)
@@ -133,6 +203,9 @@ def run(findings: list[Finding], ctx: ContextPackage, cfg
                 if len(kept_in_test) > 5 else "")
         print(f"  [s5-prefilter] kept {len(kept_in_test)} secret-class "
               f"finding(s) in test paths: {shown}{more}", file=sys.stderr)
+    if backfilled:
+        print(f"  [s5-prefilter] AST backfill: filled source/sink refs on "
+              f"{backfilled} finding(s)", file=sys.stderr)
 
     s7d = getattr(cfg, "step7_dedup", None)
     line_tol = getattr(s7d, "line_tolerance", 10)
@@ -149,7 +222,8 @@ def run(findings: list[Finding], ctx: ContextPackage, cfg
         print(f"  [s5-prefilter] {len(keep)} survivors ≥ pre_verify_threshold "
               f"{pre_thresh} → running semantic dedup ahead of s6",
               file=sys.stderr)
-        keep, sem_dropped = s7_dedup.run(keep, cfg, label="s5-prefilter")
+        keep, sem_dropped = s7_dedup.run(keep, cfg, label="s5-prefilter",
+                         ctx=ctx)
         for d in sem_dropped:
             # canonical_idx points into the *pre-verify* list and would be
             # stale once s6 drops FPs and re-dedups; report reasoning only.
@@ -164,7 +238,11 @@ def run(findings: list[Finding], ctx: ContextPackage, cfg
         breakdown = ", ".join(f"{n} {k.lower()}" for k, n in sorted(by.items()))
         print(f"  [s5-prefilter] {len(findings)} → {len(keep)} ({breakdown})",
               file=sys.stderr)
+        log.info("s5/prefilter: complete - input=%d output=%d dropped=%d reason_breakdown=%s",
+                 len(findings), len(keep), len(dropped), breakdown)
     else:
         print(f"  [s5-prefilter] {len(findings)} → {len(keep)} (nothing dropped)",
               file=sys.stderr)
+        log.info("s5/prefilter: complete - input=%d output=%d dropped=0",
+                 len(findings), len(keep))
     return keep, dropped

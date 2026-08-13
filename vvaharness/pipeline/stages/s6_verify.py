@@ -26,9 +26,12 @@ DroppedFinding entries for the audit trail.
 """
 from __future__ import annotations
 import fnmatch
+import logging
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+log = logging.getLogger(__name__)
 
 from vvaharness.models import ContextPackage, Finding, DroppedFinding
 from vvaharness.backends.llm import agentic
@@ -38,6 +41,7 @@ from vvaharness.report.redact import redact
 from vvaharness.util import errlog as _errlog
 from vvaharness.backends import claude_cli as cli
 from vvaharness.backends.claude_cli import GuardrailBlocked
+from vvaharness.pipeline.callgraph_consumer import graph_view, qnodes_at
 from vvaharness.pipeline.stages.s1_preprocess import q_file
 
 
@@ -63,19 +67,28 @@ Tools available: Read, Glob, Grep. Use them — do not reason from the snippet
 alone.
 
 WORKFLOW
-  A. Open the cited file at the cited line. Establish what the code really
-     does (the scanner's description is a claim, not evidence).
-  B. Walk the call chain outward: Grep for callers, read imports, follow the
-     data backward until you reach an external entry point or run out of
-     callers. No external entry point → not exploitable.
-  C. Try to kill the finding. Look specifically for: input validation or
+  A. Start from the CALL GRAPH CONTEXT section in the user prompt (it is
+      SQLite-backed graph metadata from prior stages). Validate those edges
+      in code with Grep/Read; do not assume they are perfect.
+  B. Open the cited file at the cited line. Establish what the code really
+      does (the scanner's description is a claim, not evidence).
+  C. Walk the call chain outward: follow callers/callees from graph context,
+      then verify each hop in source. Continue backward until you reach an
+      external entry point or run out of callers. No external entry point →
+      not exploitable.
+  D. Try to kill the finding. Look specifically for: input validation or
      allow-lists earlier in the flow; framework-level encoding /
      parameterisation; type or length constraints; auth/authz gates in front
      of the route; feature flags or config that disable the path in prod;
      the code being test-only or simply never invoked.
-  D. If you found a defence in (C), probe it: does it cover every route into
+  E. If you found a defence in (D), probe it: does it cover every route into
      the sink, or only the one you happened to read? Can edge-case input
      (encoding tricks, nulls, oversized values) slip past it?
+
+If the call graph is sparse/ambiguous for this finding, say that clearly and
+fall back to broader code-led verification (imports, router wiring, dispatch,
+and upstream callers discovered via Grep). Missing graph edges are NOT enough
+to refute a finding by themselves.
 
 {EXCLUSION_RULES}
 
@@ -111,7 +124,9 @@ CVSS: CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_"""
 def run(findings: list[Finding], ctx: ContextPackage, cfg
         ) -> tuple[list[Finding], list[DroppedFinding]]:
     """Verify every finding. Returns (verified, dropped)."""
+    log.info("s6/verify: starting verification - findings=%d", len(findings))
     if not findings:
+        log.info("s6/verify: no findings to verify")
         return [], []
 
     parallel = getattr(cfg.step6_verify, "parallel", 4)
@@ -189,6 +204,8 @@ def run(findings: list[Finding], ctx: ContextPackage, cfg
     print(f"  [s6-verify] done: {tp} TRUE_POSITIVE, {fp} FALSE_POSITIVE, "
           f"{unc} UNCONFIRMED, {gb} GUARDRAIL_BLOCKED, {errs} errors",
           file=sys.stderr)
+    log.info("s6/verify: verification complete - tp=%d fp=%d unconfirmed=%d guardrail=%d errors=%d",
+             tp, fp, unc, gb, errs)
     return verified, dropped
 
 
@@ -253,6 +270,65 @@ def _callers_of(file: str, ctx: ContextPackage, limit: int = 15) -> list[str]:
     return out
 
 
+def _candidate_qnodes_for_finding(f: Finding, ctx: ContextPackage,
+                                  limit: int = 6) -> list[str]:
+    """Best-effort qnodes for the finding location.
+
+    Uses the shared, call-graph-first resolver: spans corroborate the precise
+    function, the call graph's file membership is the fallback.
+    """
+    return qnodes_at(graph_view(ctx), f.file or "",
+                     int(f.line_start or 1), int(f.line_end or f.line_start or 1),
+                     limit=limit)
+
+
+def _callgraph_context_for_finding(f: Finding, ctx: ContextPackage) -> str:
+    graph = ctx.call_graph or {}
+    if not graph:
+        return "CALL GRAPH CONTEXT (sqlite-hydrated): (none available)"
+
+    cands = _candidate_qnodes_for_finding(f, ctx)
+    rev = graph_view(ctx).rev
+
+    lines = [
+        "CALL GRAPH CONTEXT (sqlite-hydrated; validate each edge with Grep/Read):",
+        f"  - graph nodes: {len(graph)}",
+        f"  - graph edges: {sum(len(v or ()) for v in graph.values())}",
+    ]
+    if f.source_ref:
+        marker = " (inferred from AST, unverified)" if "source_ref" in f.backfilled_refs else ""
+        lines.append(f"  - finding.source_ref: {f.source_ref}{marker}")
+    if f.sink_ref:
+        marker = " (inferred from AST, unverified)" if "sink_ref" in f.backfilled_refs else ""
+        lines.append(f"  - finding.sink_ref: {f.sink_ref}{marker}")
+
+    if not cands:
+        lines.append("  - candidate functions at finding location: (none)")
+        lines.append("  - action: use Grep on file/class symbols to recover callers/callees from code")
+        return "\n".join(lines)
+
+    lines.append("  - candidate functions at/near finding line:")
+    for qn in cands:
+        lines.append(f"    - {qn}")
+
+    for qn in cands:
+        callers = rev.get(qn, [])[:8]
+        callees = (graph.get(qn) or [])[:8]
+        lines.append(f"  - around {qn}:")
+        if callers:
+            for c in callers:
+                lines.append(f"    - caller -> {c} -> {qn}")
+        else:
+            lines.append("    - caller -> (none in graph)")
+        if callees:
+            for c in callees:
+                lines.append(f"    - callee -> {qn} -> {c}")
+        else:
+            lines.append("    - callee -> (none in graph)")
+
+    return "\n".join(lines)
+
+
 def _build_user_prompt(f: Finding, ctx: ContextPackage) -> str:
     pre = "\n".join(f"  - {p}" for p in f.preconditions) or "  (none listed)"
 
@@ -267,6 +343,7 @@ def _build_user_prompt(f: Finding, ctx: ContextPackage) -> str:
     callers = _callers_of(f.file, ctx)
     cg_block = ("KNOWN CALLERS OF THIS FILE (from call graph — verify with Grep):\n"
                 + "\n".join(callers)) if callers else ""
+    cg_focus = _callgraph_context_for_finding(f, ctx)
 
     controls = _controls_for(f.file, ctx)
     ctl_block = ("DESIGN CONTROLS IN EFFECT ON THIS PATH:\n"
@@ -277,7 +354,7 @@ def _build_user_prompt(f: Finding, ctx: ContextPackage) -> str:
 
     notes_block = (f"ARCHITECTURE NOTES:\n{ctx.notes}") if ctx.notes else ""
 
-    arch = "\n\n".join(b for b in (ep_block, cg_block, ctl_block, notes_block) if b)
+    arch = "\n\n".join(b for b in (cg_focus, ep_block, cg_block, ctl_block, notes_block) if b)
 
     return f"""FINDING TO VERIFY:
 File: {f.file}
@@ -298,13 +375,14 @@ Code snippet (as reported by scanner — verify against actual file):
 {f.code_snippet}
 
 ═══════════════════════════════════════════════════════════════════════════
-ARCHITECTURE CONTEXT (from prior repo analysis — use as starting points,
+ARCHITECTURE CONTEXT (from prior repo analysis and sqlite callgraph — use as starting points,
 but VERIFY against actual code; this may be incomplete or stale):
 ═══════════════════════════════════════════════════════════════════════════
 {arch or "(none captured)"}
 
-Investigate using Read/Grep, then end with the two required VERDICT and CVSS
-lines."""
+Investigate using Read/Grep. Start with CALL GRAPH CONTEXT, and if it is
+ambiguous/incomplete for this finding, expand to broader code-led tracing.
+Then end with the two required VERDICT and CVSS lines."""
 
 
 def _parse_verdict(raw: str) -> tuple[str, int, str, str | None, str]:

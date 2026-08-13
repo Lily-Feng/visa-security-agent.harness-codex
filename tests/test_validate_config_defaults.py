@@ -83,9 +83,9 @@ def test_overrides_apply_without_mutating_environ(tmp_path: Path, monkeypatch) -
         overrides={"max_turns": _OVR_TURNS, "effort": EffortLevel.LOW,
                    "max_budget_usd": _OVR_BUDGET, "max_findings": _OVR_FINDINGS},
     )
-    assert cfg.claude.max_turns == _OVR_TURNS
-    assert cfg.claude.effort == EffortLevel.LOW
-    assert cfg.claude.max_budget_usd == _OVR_BUDGET
+    assert cfg.agent.max_turns == _OVR_TURNS
+    assert cfg.agent.effort == EffortLevel.LOW
+    assert cfg.agent.max_budget_usd == _OVR_BUDGET
     assert cfg.max_findings == _OVR_FINDINGS
     # The laundering is gone: nothing was written to the process environment.
     for env_key in (ENV_EFFORT, ENV_MAX_TURNS, ENV_MAX_BUDGET_USD, ENV_MAX_FINDINGS):
@@ -96,10 +96,10 @@ def test_string_effort_override_coerces_to_enum(tmp_path: Path, monkeypatch) -> 
     # A profile supplies effort as a bare string; it must coerce to the typed enum.
     monkeypatch.delenv(ENV_EFFORT, raising=False)
     cfg = load_config(tmp_path, overrides={"effort": "medium"})
-    assert cfg.claude.effort == EffortLevel.MEDIUM
+    assert cfg.agent.effort == EffortLevel.MEDIUM
 
 
 def test_env_fallback_preserved_when_unset(tmp_path: Path, monkeypatch) -> None:
     # With no override, a VVAHARNESS_* env value still flows through.
     monkeypatch.setenv(ENV_MAX_TURNS, str(_ENV_TURNS))
-    assert load_config(tmp_path).claude.max_turns == _ENV_TURNS
+    assert load_config(tmp_path).agent.max_turns == _ENV_TURNS

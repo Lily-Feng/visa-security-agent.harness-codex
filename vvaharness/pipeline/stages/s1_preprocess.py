@@ -20,14 +20,18 @@ needed. We give it a system prompt, point it at the repo, and ask it to
 produce a JSON ContextPackage.
 """
 from __future__ import annotations
+import ast
 import configparser
 import fnmatch
 import hashlib
 import json
+import logging
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 from vvaharness.models import ContextPackage, CVE, Control
 from vvaharness.backends.llm import agentic
@@ -77,6 +81,15 @@ _DEFAULT_EXCLUDE_GLOBS = (
     "**/LICENSE", "**/LICENSE.*", "**/NOTICE",
 )
 
+_GAP_FILL_ESCALATE_REPO_KINDS = frozenset({"web-api", "web-app", "service"})
+_GAP_FILL_SERVICE_HINTS = frozenset({
+    "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    "chart.yaml", "values.yaml", "procfile", "wsgi.py", "asgi.py",
+})
+_GAP_FILL_WEBAPP_SUFFIXES = (
+    ".html", ".htm", ".jinja", ".jinja2", ".jsx", ".tsx", ".vue", ".svelte",
+)
+
 
 def _exclusion_sets(cfg) -> tuple[set[str], set[str], list[str]]:
     """Resolve (dirs, exts, globs) once — built-in defaults + config.yaml step1.* appends.
@@ -88,6 +101,59 @@ def _exclusion_sets(cfg) -> tuple[set[str], set[str], list[str]]:
     excl_globs = list(_DEFAULT_EXCLUDE_GLOBS) + list(
         getattr(cfg.step1, "exclude_globs", None) or [])
     return excl_dirs, excl_exts, excl_globs
+
+
+def _seed_repo_kinds(seed, all_files: list[str]) -> set[str]:
+    """Cheap repo-kind guess for deciding whether S1 should stay in gap_fill.
+
+    This is intentionally path/seed based only: the decision must be available
+    before any agentic exploration and should not require another code pass.
+    """
+    kinds: set[str] = set()
+    if any((getattr(ep, "kind", "") or "").lower() == "network"
+           or bool(getattr(ep, "reachable_from_unauth", False))
+            for ep in getattr(seed, "entry_points", ()) or ()): 
+        kinds.add("web-api")
+
+    low_files = [f.lower() for f in all_files]
+    base_names = {Path(f).name.lower() for f in all_files}
+    if any(name in _GAP_FILL_SERVICE_HINTS for name in base_names):
+        kinds.add("service")
+    if any(f.endswith(_GAP_FILL_WEBAPP_SUFFIXES) for f in low_files):
+        kinds.add("web-app")
+    return kinds or {"library"}
+
+
+def _should_escalate_gap_fill(seed, all_files: list[str]) -> tuple[bool, str]:
+    """Decide whether sparse S0 seed coverage should re-enable S1 discovery.
+
+    Starter policy:
+      - source files > 500
+      - repo kind includes web-api/web-app/service
+      - entry points >= 10
+      - sinks < 5
+    """
+    source_files = sum(1 for f in all_files if Path(f).suffix.lower() in EXT_TO_LANG)
+    if source_files <= 500:
+        return False, f"source_files={source_files} <= 500"
+
+    kinds = _seed_repo_kinds(seed, all_files)
+    active_kinds = sorted(kinds & _GAP_FILL_ESCALATE_REPO_KINDS)
+    if not active_kinds:
+        return False, f"repo_kind={sorted(kinds)}"
+
+    entry_points = len(getattr(seed, "entry_points", ()) or ())
+    if entry_points < 10:
+        return False, f"entry_points={entry_points} < 10"
+
+    sinks = len(getattr(seed, "unsafe_sinks", ()) or ())
+    if sinks >= 5:
+        return False, f"sinks={sinks} >= 5"
+
+    return True, (
+        f"source_files={source_files}, repo_kind={active_kinds}, "
+        f"entry_points={entry_points}, sinks={sinks}"
+    )
 
 
 def glob_hit(rel: str, globs) -> str | None:
@@ -162,12 +228,12 @@ def _walk_repo(repo_root: str, cfg) -> tuple[list[str], dict]:
     max_kb = getattr(cfg.step1, "max_file_kb", 1024)
     # Default-secure AND not config-disableable: in-tree symlinks (common in
     # monorepos) are still scanned, but links whose target resolves OUTSIDE the
-    # repo are dropped UNCONDITIONALLY (see the loop below). `follow_symlinks`
-    # used to gate that containment check off — letting an untrusted repo's
-    # off-root link + a shared/CI config writer exfiltrate host files (SSH keys,
-    # /etc/passwd) into the inventory and LLM prompts. It no longer does. The key
-    # is still accepted for back-compat; if it is set, warn that off-root targets
-    # remain blocked rather than silently ignore the operator's intent.
+    # repo are dropped UNCONDITIONALLY (see the loop below). This blocks an
+    # untrusted repo's off-root link plus a shared/CI config writer from
+    # exfiltrating host files (SSH keys, /etc/passwd) into the inventory and
+    # LLM prompts. `follow_symlinks` is still accepted for back-compat; if it
+    # is set, warn that off-root targets remain blocked rather than silently
+    # ignore the operator's intent.
     follow_symlinks = bool(getattr(cfg.step1, "follow_symlinks", False))
     if follow_symlinks:
         print("  [s1] NOTE: step1.follow_symlinks is set, but symlinks whose "
@@ -563,11 +629,188 @@ def q_name(qname: str) -> str:
     return q_split(qname)[1]
 
 
+# ── import-aware callee resolution helpers ──────────────────────────────────
+
+# Regex-based import parsers keyed by file extension.  Each pattern yields
+# (alias, fq_module) pairs where alias is the local name a caller uses.
+_IMPORT_RXS: dict[str, list[re.Pattern]] = {
+    ".py": [
+        # from x.y import z [as alias]
+        re.compile(r"^from\s+([\w.]+)\s+import\s+(\w+)(?:\s+as\s+(\w+))?"),
+        # import x.y.z [as alias]
+        re.compile(r"^import\s+([\w.]+)(?:\s+as\s+(\w+))?"),
+    ],
+    ".java": [
+        re.compile(r"^import\s+(?:static\s+)?([\w.]+)\.([\w*]+)\s*;"),
+    ],
+    ".js": [
+        re.compile(r"""^(?:const|let|var)\s+\{?(\w+)\}?\s*=\s*require\s*\(['"]([^'"]+)['"]\)"""),
+        re.compile(r"""^import\s+(?:\{?\s*(\w+)\s*\}?)\s+from\s+['"]([^'"]+)['"]"""),
+    ],
+    ".ts": [
+        re.compile(r"""^import\s+(?:\{?\s*(\w+)\s*\}?)\s+from\s+['"]([^'"]+)['"]"""),
+    ],
+    ".go": [
+        re.compile(r"""^\s+(\w+)?\s*["]([\w./]+)["]\s*$"""),
+    ],
+    ".cs": [
+        re.compile(r"^using\s+([\w.]+)\s*;"),
+        re.compile(r"^using\s+(\w+)\s*=\s*([\w.]+)\s*;"),
+    ],
+}
+_IMPORT_RXS[".jsx"] = _IMPORT_RXS[".js"]
+_IMPORT_RXS[".tsx"] = _IMPORT_RXS[".ts"]
+_IMPORT_RXS[".cjs"] = _IMPORT_RXS[".js"]
+_IMPORT_RXS[".mjs"] = _IMPORT_RXS[".js"]
+
+
+def _resolve_py_import_module(caller_file: str, module: str, level: int) -> str:
+    """Resolve a Python ImportFrom module to an absolute dotted module path.
+
+    Example:
+      caller_file="pkg/sub/handler.py", module="services", level=1
+      -> "pkg.sub.services"
+    """
+    rel = caller_file.replace("\\", "/").strip("/")
+    dirs = [p for p in rel.split("/")[:-1] if p]
+    # In Python AST, level=1 means "current package" (no upward hop),
+    # level=2 means "one parent", etc.
+    up = max(0, level - 1)
+    if up:
+        base = dirs[:-up] if up <= len(dirs) else []
+    else:
+        base = dirs
+    mod_parts = [p for p in module.split(".") if p]
+    parts = base + mod_parts
+    return ".".join(parts)
+
+
+def _scan_imports(lines: list[str], ext: str, caller_file: str = "") -> dict[str, str]:
+    """Return {local_name: fq_module} for the given file's import statements.
+
+    Only simple, statically-detectable imports are captured; star imports and
+    dynamic imports fall back to the proximity scorer in _resolve_callee_files.
+    """
+    # Python uses AST parsing so multiline imports, aliases, and relative
+    # imports are handled structurally rather than by line regexes.
+    if ext == ".py":
+        src = "\n".join(lines)
+        result: dict[str, str] = {}
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        mod = (alias.name or "").strip()
+                        if not mod:
+                            continue
+                        local = alias.asname or mod.split(".")[0]
+                        result[local] = mod
+                elif isinstance(node, ast.ImportFrom):
+                    level = int(getattr(node, "level", 0) or 0)
+                    mod = (node.module or "").strip()
+                    resolved_mod = _resolve_py_import_module(caller_file, mod, level)
+                    for alias in node.names:
+                        if alias.name == "*":
+                            continue
+                        local = alias.asname or alias.name
+                        # Map imported symbol -> module path (not module.symbol)
+                        # so the resolver can match files like pkg/sub/services.py.
+                        if resolved_mod:
+                            result[local] = resolved_mod
+                        elif mod:
+                            result[local] = mod
+            if result:
+                return result
+    patterns = _IMPORT_RXS.get(ext)
+    if not patterns:
+        return {}
+    result: dict[str, str] = {}
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped or stripped.startswith(("#", "//")):
+            continue
+        if ext == ".py":
+            m = patterns[0].match(stripped)
+            if m:
+                mod, _sym, alias = m.group(1), m.group(2), m.group(3)
+                local = alias if alias else _sym
+                result[local] = mod
+                continue
+            m = patterns[1].match(stripped)
+            if m:
+                mod, alias = m.group(1), m.group(2)
+                local = alias if alias else mod.split(".")[0]
+                result[local] = mod
+            continue
+        if ext == ".java":
+            m = patterns[0].match(stripped)
+            if m:
+                pkg, sym = m.group(1), m.group(2)
+                if sym != "*":
+                    result[sym] = f"{pkg}.{sym}"
+            continue
+        if ext in (".js", ".jsx", ".cjs", ".mjs", ".ts", ".tsx"):
+            for p in patterns:
+                m = p.match(stripped)
+                if m:
+                    sym, mod = m.group(1), m.group(2)
+                    if sym:
+                        result[sym] = mod
+                    break
+            continue
+        if ext == ".go":
+            m = patterns[0].match(stripped)
+            if m:
+                alias, mod = m.group(1), m.group(2)
+                local = alias if alias else mod.rsplit("/", 1)[-1]
+                result[local] = mod
+            continue
+        if ext == ".cs":
+            m = patterns[1].match(stripped)
+            if m:
+                result[m.group(1)] = m.group(2)
+                continue
+            m = patterns[0].match(stripped)
+            if m:
+                ns = m.group(1)
+                result[ns.rsplit(".", 1)[-1]] = ns
+    return result
+
+
+def _file_matches_import(file_path: str, fq_module: str, ext: str) -> bool:
+    """Return True if file_path is the likely definition site for fq_module.
+
+    Converts 'com.foo.Bar' → 'com/foo/Bar' and checks whether file_path ends
+    with that path (with or without the extension).
+    """
+    as_path = fq_module.replace(".", "/").replace("//", "/")
+    norm = file_path.replace("\\", "/")
+    stem = norm[: -len(ext)] if norm.endswith(ext) else norm
+    if stem.endswith(as_path) or norm.endswith(as_path + ext):
+        return True
+    if ext == ".py" and norm.endswith(as_path + "/__init__.py"):
+        return True
+    return False
+
+
 def _resolve_callee_files(name: str, caller_file: str,
                           def_files: dict[str, set[str]],
-                          max_targets: int) -> list[str]:
+                          max_targets: int,
+                          caller_imports: dict[str, str] | None = None) -> list[str]:
     """Pick ≤max_targets def-site files for bare `name` when called from
-    `caller_file`. Same-file > unique > longest-common-dir-prefix."""
+    `caller_file`.
+
+    Resolution order:
+    1. Same file (unambiguous).
+    2. Import-aware exact match — if the caller imports ``name`` from a known
+       module and a def-site file path matches that module, return it directly.
+    3. Longest-common-dir-prefix proximity (original heuristic), capped at
+       ``max_targets``.
+    """
     cands = def_files.get(name)
     if not cands:
         return []
@@ -575,6 +818,20 @@ def _resolve_callee_files(name: str, caller_file: str,
         return [caller_file]
     if len(cands) == 1:
         return list(cands)
+    # Import-aware exact match — short-circuit proximity ranking when the
+    # caller's imports tell us exactly which module ``name`` came from.
+    if caller_imports and name in caller_imports:
+        fq = caller_imports[name]
+        caller_ext = "." + caller_file.rsplit(".", 1)[-1] if "." in caller_file else ""
+        # Try module path first (from x.y import name -> x.y.py), then a
+        # symbol-as-module fallback (from x import name -> x/name.py).
+        probes = [fq, f"{fq}.{name}"] if fq else [name]
+        matches = [
+            f for f in cands
+            if any(_file_matches_import(f, probe, caller_ext) for probe in probes)
+        ]
+        if matches:
+            return matches[:max_targets]
     cp = caller_file.split("/")
     def _score(f: str) -> int:
         n = 0
@@ -621,6 +878,62 @@ def _scan_defs(lines: list[str]) -> list[tuple[int, str]]:
     return out
 
 
+def _seed_covered_languages(data: dict) -> set[str]:
+    """Languages that S0's callgraph artifacts actually name a file in.
+
+    S0's engine only has plugins for a handful of languages, so its graph can
+    only ever describe files in those languages. Deriving the covered set from
+    the artifacts themselves (rather than hard-coding the plugin list) means a
+    plugin language that happened to contribute no nodes is treated as residual
+    and re-scanned, which only improves coverage.
+    """
+    langs: set[str] = set()
+
+    def _add(rel: str) -> None:
+        lang = EXT_TO_LANG.get(Path(rel).suffix.lower())
+        if lang:
+            langs.add(lang)
+
+    for qn in (data.get("def_spans") or {}):
+        _add(q_file(qn))
+    for qn, vs in (data.get("call_graph") or {}).items():
+        _add(q_file(qn))
+        for v in vs or ():
+            _add(q_file(v))
+    for locs in (data.get("call_graph_files") or {}).values():
+        for loc in locs or ():
+            f = loc.rpartition(":")[0]
+            if f:
+                _add(f)
+    return langs
+
+
+def _merge_graph_artifacts(data: dict, seed_cg: dict, seed_cgf: dict,
+                           seed_spans: dict) -> None:
+    """Merge S0's snapshotted artifacts back over a residual-language rebuild.
+
+    ``ts_graph.build`` overwrites ``data``'s three graph dicts, so S0's
+    (plugin-language) graph is snapshotted before the residual build and folded
+    back in here. Keys are qnodes ``file::name`` for the edge/span maps (no
+    cross-language collisions) and bare names for ``call_graph_files`` (which
+    CAN collide across languages, so those lists are unioned). S0's def_spans
+    win on the rare qnode collision — its AST spans are authoritative.
+    """
+    cg = data.get("call_graph") or {}
+    for k, vs in seed_cg.items():
+        cg[k] = sorted(set(cg.get(k, ())) | set(vs or ()))
+    data["call_graph"] = cg
+
+    cgf = data.get("call_graph_files") or {}
+    for k, vs in seed_cgf.items():
+        cgf[k] = sorted(set(cgf.get(k, ())) | set(vs or ()))
+    data["call_graph_files"] = cgf
+
+    spans = data.get("def_spans") or {}
+    spans.update(seed_spans)   # seed (plugin AST) wins on collision
+    data["def_spans"] = spans
+
+
 def _supplement_call_graph(data: dict, all_files: list[str],
                            repo_root: Path, cfg) -> None:
     s1 = getattr(cfg, "step1", None)
@@ -652,6 +965,7 @@ def _supplement_call_graph(data: dict, all_files: list[str],
     seen_call_tokens: set[str] = set()
     fn_locs: dict[str, set[str]] = defaultdict(set)
     def_files: dict[str, set[str]] = defaultdict(set)
+    imports_by_file: dict[str, dict[str, str]] = {}
     for rel in all_files:
         if Path(rel).suffix.lower() not in EXT_TO_LANG:
             continue
@@ -667,6 +981,7 @@ def _supplement_call_graph(data: dict, all_files: list[str],
             def_files[name].add(rel)
         for m in _CALL_TOKEN_RX.finditer(text):
             seen_call_tokens.add(m.group(1))
+        imports_by_file[rel] = _scan_imports(lines, Path(rel).suffix.lower(), rel)
         src_files.append((rel, lines, defs))
 
     seen_any = seen_call_tokens | set(fn_locs)
@@ -685,7 +1000,8 @@ def _supplement_call_graph(data: dict, all_files: list[str],
                 n_dropped += 1
                 continue
             for cf in caller_sites:
-                tgts = (_resolve_callee_files(callee, cf, def_files, max_targets)
+                ci = imports_by_file.get(cf) if cf else None
+                tgts = (_resolve_callee_files(callee, cf, def_files, max_targets, ci)
                         if cf else sorted(def_files.get(callee, ()))[:max_targets])
                 if not tgts:
                     if do_validate:
@@ -708,20 +1024,59 @@ def _supplement_call_graph(data: dict, all_files: list[str],
             rx = re.compile(r"(?<!\w)(" + "|".join(esc) + r")\s*\(")
             new_targets: set[str] = set()
             for rel, lines, defs in src_files:
+                _is_py = Path(rel).suffix.lower() == ".py"
+                # Scope tracking — Python uses indent-level stack; brace-based
+                # languages count { / } depth.  Both reset cur to None when the
+                # enclosing function scope ends so module-level code between two
+                # functions is attributed to MODULE_SCOPE rather than the
+                # previous function.
+                scope_stack: list[tuple[str, int]] = []  # Python: [(name, def_indent)]
+                brace_depth = 0      # net open-braces inside current function
+                brace_entered = False  # have we seen the opening '{' for this fn?
                 cur = None
                 di = 0
                 for lineno, ln in enumerate(lines, 1):
+                    stripped = ln.lstrip()
+                    # ── scope exit (check before advancing to next def) ──────
+                    if cur is not None:
+                        if _is_py:
+                            if stripped and stripped[0] != "#":
+                                curr_indent = len(ln) - len(stripped)
+                                while scope_stack and curr_indent <= scope_stack[-1][1]:
+                                    scope_stack.pop()
+                                cur = scope_stack[-1][0] if scope_stack else None
+                        else:
+                            for ch in ln:
+                                if ch == "{":
+                                    brace_depth += 1
+                                    brace_entered = True
+                                elif ch == "}":
+                                    brace_depth = max(0, brace_depth - 1)
+                            if brace_entered and brace_depth == 0:
+                                cur = None
+                                brace_entered = False
+                    # ── scope advance ────────────────────────────────────────
                     while di < len(defs) and defs[di][0] <= lineno:
-                        cur = defs[di][1]
+                        name = defs[di][1]
+                        if _is_py:
+                            def_ln = lines[defs[di][0] - 1]
+                            def_indent = len(def_ln) - len(def_ln.lstrip())
+                            scope_stack.append((name, def_indent))
+                        else:
+                            brace_depth = 0
+                            brace_entered = False
+                        cur = name
                         di += 1
+                    # ── emit edges ───────────────────────────────────────────
                     for m in rx.finditer(ln):
                         callee = m.group(1)
                         enclosing = cur if cur is not None else MODULE_SCOPE
                         if enclosing == callee:
                             continue
                         qcur = q_join(rel, enclosing)
+                        _ci = imports_by_file.get(rel)
                         for tf in _resolve_callee_files(callee, rel, def_files,
-                                                        max_targets):
+                                                        max_targets, _ci):
                             qcal = q_join(tf, callee)
                             if qcal not in cg[qcur]:
                                 cg[qcur].add(qcal)
@@ -778,7 +1133,14 @@ Do NOT include raw source code in the output. Include file paths, line numbers,
 function names, and short snippets (max 120 chars each) only."""
 
 
-def run(repo_root: str, cfg, known_cves: list[CVE], controls: list[Control]) -> ContextPackage:
+def run(repo_root: str, cfg, known_cves: list[CVE], controls: list[Control],
+        seed=None) -> ContextPackage:
+    """``seed`` is the optional s0_seed.SeedPackage. When present its
+    entry_points/unsafe_sinks are merged into the ContextPackage AFTER the
+    agentic phase (so the deterministic exclusion filter still applies).
+    In ``gap_fill`` mode S1 skips agentic exploration only when the S0 seed is
+    strong enough; sparse seed coverage on a large app repo escalates back to
+    agentic discovery."""
     cve_block = "\n".join(f"  - {c.id}: {c.summary}" for c in known_cves) or "  (none)"
 
     # Option B: tell the agent up front which dirs/patterns to skip so it
@@ -811,15 +1173,50 @@ Explore the codebase thoroughly, then output the JSON ContextPackage."""
     else:
         tools = ["Read", "Glob", "Grep", "Bash"]
 
-    raw = agentic(
-        user_prompt,
-        model=cfg.models.preprocess,
-        system_prompt=SYSTEM,
-        allowed_tools=tools,
-        cwd=repo_root,
-        max_budget_usd=cfg.step1.max_budget_usd,
-        max_turns=getattr(cfg.step1, "max_turns", None),
-    )
+    # Inject repo_root, ground-truth file list, CVEs, controls (not generated by the model)
+    # Reuse s0's walk when it ran (taint profile) rather than walking the repo a
+    # second time; both the file list and the exclusion report travel on the
+    # seed. Fall back to our own walk when s0 was disabled or produced no walk
+    # (e.g. a checkpoint from before the walk was threaded, on --resume).
+    if seed is not None and getattr(seed, "all_files", None):
+        all_files, excluded = list(seed.all_files), dict(seed.excluded)
+    else:
+        all_files, excluded = _walk_repo(repo_root, cfg)
+    all_files, dedup_report = _dedup_configs(all_files, Path(repo_root), cfg)
+    excluded["config_dedup"] = dedup_report
+    tracker = getattr(cfg, "_scan_progress", None)
+    if tracker is not None:
+        tracker.discovered(all_files)
+
+    mode = getattr(cfg.step1, "mode", "full")
+    effective_mode = mode
+    if mode == "gap_fill" and seed:
+        escalate, reason = _should_escalate_gap_fill(seed, all_files)
+        if escalate:
+            effective_mode = "full"
+            print(f"  [s1] mode=gap_fill — escalating to agentic discovery "
+                  f"({reason})", file=sys.stderr)
+            log.info("s1/preprocess: gap_fill escalated to full mode - reason=%s", reason)
+        else:
+            print(f"  [s1] mode=gap_fill — using s0 seed "
+                  f"({len(seed.entry_points)} EPs / {len(seed.unsafe_sinks)} sinks); "
+                  f"skipping agentic exploration ({reason})", file=sys.stderr)
+            log.info("s1/preprocess: using gap_fill mode with s0 seed - "
+                     "entry_points=%d sinks=%d reason=%s",
+                     len(seed.entry_points), len(seed.unsafe_sinks), reason)
+
+    if effective_mode == "gap_fill" and seed:
+        raw = "{}"
+    else:
+        raw = agentic(
+            user_prompt,
+            model=cfg.models.preprocess,
+            system_prompt=SYSTEM,
+            allowed_tools=tools,
+            cwd=repo_root,
+            max_budget_usd=cfg.step1.max_budget_usd,
+            max_turns=getattr(cfg.step1, "max_turns", None),
+        )
 
     # The agentic output may have tool-use chatter before the final JSON.
     # Extract the last JSON block.
@@ -852,11 +1249,6 @@ Explore the codebase thoroughly, then output the JSON ContextPackage."""
             print(f"  [s1] unwrapping model output from "
                   f"{next(iter(data))!r} container", file=sys.stderr)
             data = inner
-
-    # Inject repo_root, ground-truth file list, CVEs, controls (not generated by the model)
-    all_files, excluded = _walk_repo(repo_root, cfg)
-    all_files, dedup_report = _dedup_configs(all_files, Path(repo_root), cfg)
-    excluded["config_dedup"] = dedup_report
 
     # Option A: deterministically strip any agent-emitted path that isn't in
     # the exclusion-filtered ground-truth inventory. The agent ignores the
@@ -903,6 +1295,156 @@ Explore the codebase thoroughly, then output the JSON ContextPackage."""
         print(f"  [s1] filtered agent output: -{n_sinks_drop} sinks, "
               f"-{n_eps_drop} entry points (excluded/test/nonexistent paths)",
               file=sys.stderr)
+
+    # ── merge s0 static seed ────────────────────────────────────────────
+    # Seed paths are already repo-relative posix and pre-filtered to s0's
+    # in-scope set, but re-check against `keep` here so config-dedup drops
+    # propagate. Seed entries are appended AFTER agent output so the dedup
+    # in s3/s7 collapses overlap; order doesn't affect ranking.
+    if seed:
+        seed_sinks = [dict(s.model_dump(), file=hit)
+                      for s in seed.unsafe_sinks
+                      if (hit := _resolve_in_scope(s.file))]
+        seed_eps = [dict(e.model_dump(), file=hit)
+                    for e in seed.entry_points
+                    if (hit := _resolve_in_scope(e.file))]
+        data["unsafe_sinks"].extend(seed_sinks)
+        data["entry_points"].extend(seed_eps)
+        log.info("s1/preprocess: merged s0 seed - sinks=%d entry_points=%d "
+                 "engine=%s", len(seed_sinks), len(seed_eps), 
+                 getattr(seed, "engine", "unknown"))
+        # Semgrep codeFlow paths → ContextPackage.seed_taint_paths. Hops are
+        # "file:line"; re-resolve each file against the ground-truth inventory
+        # (drops out-of-scope hops but keeps the path so long as ≥2 hops
+        # survive) so s3._reachable_files can trust every file it names.
+        seed_paths: list[list[str]] = []
+        for path in getattr(seed, "taint_paths", None) or []:
+            resolved = []
+            for hop in path:
+                f, sep, ln = hop.rpartition(":")
+                hit = _resolve_in_scope(f or hop)
+                if hit:
+                    resolved.append(f"{hit}:{ln}" if sep else hit)
+            if len(resolved) >= 2:
+                seed_paths.append(resolved)
+        data["seed_taint_paths"] = seed_paths
+        log.debug("s1/preprocess: seed taint paths processed - paths=%d", len(seed_paths))
+
+        # Structured taint evidence from S0 (Phase-1) mirrors seed_taint_paths
+        # filtering: keep only evidence whose source+sink refs both resolve in
+        # scope, then best-effort prune path funcs / edges to in-scope files.
+        seed_evidence = []
+        for evidence in getattr(seed, "taint_evidence", None) or []:
+            src_file, src_sep, src_tail = evidence.source_ref.partition("::")
+            if not src_sep:
+                src_file, src_sep, src_tail = evidence.source_ref.rpartition(":")
+            src_hit = _resolve_in_scope(src_file or evidence.source_ref)
+            if not src_hit:
+                continue
+            source_ref = f"{src_hit}{src_sep}{src_tail}" if src_sep else src_hit
+
+            sink_file, sink_sep, sink_tail = evidence.sink_ref.rpartition(":")
+            sink_hit = _resolve_in_scope(sink_file or evidence.sink_ref)
+            if not sink_hit:
+                continue
+            sink_ref = f"{sink_hit}:{sink_tail}" if sink_sep else sink_hit
+
+            path_funcs = []
+            for qn in evidence.path_funcs:
+                q_file, sep, q_tail = qn.partition("::")
+                q_hit = _resolve_in_scope(q_file)
+                if q_hit:
+                    path_funcs.append(f"{q_hit}{sep}{q_tail}" if sep else q_hit)
+
+            edges = []
+            for edge in evidence.edges:
+                edge_hit = _resolve_in_scope(edge.file)
+                if not edge_hit:
+                    continue
+
+                fn_file, fn_sep, fn_tail = edge.function_qnode.partition("::")
+                fn_hit = _resolve_in_scope(fn_file)
+                if fn_hit:
+                    function_qnode = (f"{fn_hit}{fn_sep}{fn_tail}"
+                                      if fn_sep else fn_hit)
+                else:
+                    function_qnode = edge.function_qnode
+
+                src_q_file, src_q_sep, src_q_tail = edge.src.qnode.partition("::")
+                src_q_hit = _resolve_in_scope(src_q_file)
+                src_qnode = (f"{src_q_hit}{src_q_sep}{src_q_tail}"
+                             if src_q_hit else edge.src.qnode)
+
+                dst_q_file, dst_q_sep, dst_q_tail = edge.dst.qnode.partition("::")
+                dst_q_hit = _resolve_in_scope(dst_q_file)
+                dst_qnode = (f"{dst_q_hit}{dst_q_sep}{dst_q_tail}"
+                             if dst_q_hit else edge.dst.qnode)
+
+                edge_data = edge.model_dump()
+                edge_data["file"] = edge_hit
+                edge_data["function_qnode"] = function_qnode
+                edge_data["src"]["qnode"] = src_qnode
+                edge_data["dst"]["qnode"] = dst_qnode
+                edges.append(edge_data)
+
+            seed_evidence.append({
+                "source_ref": source_ref,
+                "sink_ref": sink_ref,
+                "path_funcs": path_funcs,
+                "edges": edges,
+                "sink_cwe": list(evidence.sink_cwe or []),
+            })
+        data["seed_taint_evidence"] = seed_evidence
+
+        # Extract framework entry points from seed.
+        # Framework markers are detected during scanning and emitted as framework-kind
+        # entry points. Extract and resolve them against in-scope inventory like
+        # regular entry points.
+        framework_eps = []
+        framework_unresolvable: set[str] = set()
+        for ep in getattr(seed, "entry_points", []) or []:
+            if getattr(ep, "kind", "").lower() == "framework":
+                hit = _resolve_in_scope(ep.file)
+                if hit:
+                    framework_eps.append(dict(ep.model_dump(), file=hit))
+                else:
+                    framework_unresolvable.add(f"{ep.file}::{ep.function}")
+        if framework_eps:
+            data["entry_points"].extend(framework_eps)
+        if framework_unresolvable:
+            sample = ", ".join(sorted(framework_unresolvable)[:3])
+            n_str = f" (+{len(framework_unresolvable)-3} more)" if len(framework_unresolvable) > 3 else ""
+            print(f"  [s1] WARN: {len(framework_unresolvable)} framework entry points "
+                  f"could not be resolved to in-scope inventory: {sample}{n_str}",
+                  file=sys.stderr)
+
+        # Reuse AST call-graph artifacts from S0 when available. This avoids
+        # reparsing the same repository in S1 for callgraph-enabled profiles.
+        if getattr(seed, "call_graph", None):
+            data["call_graph"] = {
+                k: sorted(v)
+                for k, v in (seed.call_graph or {}).items()
+                if v
+            }
+        if getattr(seed, "call_graph_files", None):
+            data["call_graph_files"] = {
+                k: sorted(v)
+                for k, v in (seed.call_graph_files or {}).items()
+                if v
+            }
+        if getattr(seed, "def_spans", None):
+            data["def_spans"] = {
+                k: [int(v[0]), int(v[1])]
+                for k, v in (seed.def_spans or {}).items()
+                if isinstance(v, list) and len(v) >= 2
+            }
+
+        if seed_sinks or seed_eps or seed_paths or seed_evidence or framework_eps:
+            print(f"  [s1] merged s0 seed: +{len(seed_eps)} entry points, "
+                  f"+{len(seed_sinks)} sinks, {len(seed_paths)} codeFlow "
+                  f"paths, +{len(framework_eps)} framework EPs ({seed.engine})", 
+                  file=sys.stderr)
+
     if ambiguous:
         uniq = sorted(set(ambiguous))
         sample = ", ".join(uniq[:5]) + ("…" if len(uniq) > 5 else "")
@@ -927,7 +1469,62 @@ Explore the codebase thoroughly, then output the JSON ContextPackage."""
     data["known_cves"] = [c.model_dump() for c in known_cves]
     data["design_controls"] = [c.model_dump() for c in controls]
 
-    _supplement_call_graph(data, all_files, Path(repo_root), cfg)
+    # Call-graph backend dispatch. ``tree_sitter`` (default) gives exact
+    # def end-lines / byte-ranges → precise enclosing-caller resolution and
+    # populates def_spans for Phase-4 function slicing. Falls back to the
+    # regex supplement when tree-sitter-language-pack is unavailable.
+    cg_mode = str(getattr(cfg.step1, "call_graph", "tree_sitter")).lower()
+    has_seed_cg = bool(data.get("call_graph"))
+    has_seed_cg_files = bool(data.get("call_graph_files"))
+    has_seed_spans = bool(data.get("def_spans"))
+
+    if has_seed_cg and has_seed_cg_files and has_seed_spans:
+        print("  [s1] reusing S0 callgraph artifacts as the primary graph",
+              file=sys.stderr)
+    elif has_seed_cg or has_seed_cg_files or has_seed_spans:
+        print("  [s1] partial S0 callgraph artifacts detected; completing in S1",
+              file=sys.stderr)
+
+    if cg_mode == "tree_sitter":
+        all_three = has_seed_cg and has_seed_cg_files and has_seed_spans
+        if all_three:
+            # S0's graph is authoritative but only covers the few languages its
+            # engine has plugins for. Reusing it wholesale would mark every file
+            # in the other ~36 languages structurally unreachable. Gate reuse on
+            # LANGUAGE COVERAGE rather than artifact non-emptiness: keep S0 as
+            # the primary graph, but back the residual-language file set with a
+            # tree-sitter rebuild and merge per language so no language is
+            # silently dropped from reachability.
+            covered = _seed_covered_languages(data)
+            residual = [
+                f for f in all_files
+                if EXT_TO_LANG.get(Path(f).suffix.lower())
+                and EXT_TO_LANG[Path(f).suffix.lower()] not in covered
+            ]
+            if residual:
+                seed_cg = dict(data.get("call_graph") or {})
+                seed_cgf = dict(data.get("call_graph_files") or {})
+                seed_spans = dict(data.get("def_spans") or {})
+                from vvaharness.lang import ts_graph
+                if ts_graph.build(data, residual, Path(repo_root), cfg):
+                    _merge_graph_artifacts(data, seed_cg, seed_cgf, seed_spans)
+                    print(f"  [s1] backed S0 graph with tree-sitter over "
+                          f"{len(residual)} residual-language file(s) "
+                          f"(langs S0 missed); merged per language",
+                          file=sys.stderr)
+                # build() returns False only when the backend is unavailable,
+                # in which case it leaves ``data`` (S0's artifacts) untouched —
+                # no restore needed.
+            else:
+                print("  [s1] S0 graph already covers every inventory language;"
+                      " reuse is complete", file=sys.stderr)
+        else:
+            from vvaharness.lang import ts_graph
+            if not ts_graph.build(data, all_files, Path(repo_root), cfg):
+                _supplement_call_graph(data, all_files, Path(repo_root), cfg)
+    else:
+        if not (has_seed_cg and has_seed_cg_files and has_seed_spans):
+            _supplement_call_graph(data, all_files, Path(repo_root), cfg)
 
     # Off-schema enum/int values (e.g. kind="rpc", line=null) are coerced by
     # field_validator(mode="before") hooks in models.py — see _coerce_enum /

@@ -17,8 +17,8 @@ limitations under the License.
 # Visa Vulnerability Agentic Harness — Agentic SAST Pipeline
 
 ![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
-![Python](https://img.shields.io/badge/python-%E2%89%A5%203.10-blue.svg)
-![Version](https://img.shields.io/badge/version-1.1.0-informational.svg)
+![Python](https://img.shields.io/badge/python-%E2%89%A5%203.11-blue.svg)
+![Version](https://img.shields.io/badge/version-1.2.0-informational.svg)
 ![Output](https://img.shields.io/badge/output-Markdown%20%2B%20SARIF%202.1.0-green.svg)
 
 VVAH is Visa's open-source harness for autonomous vulnerability discovery,
@@ -27,7 +27,7 @@ remediation, and validation using frontier AI models, built on learnings from
 initiative for AI-assisted vulnerability research).
 
 VVAH runs as a four-phase, eleven-stage pipeline from code ingest to validated
-fix:
+fix (with an optional Stage 0 static seed used by the taint-first profile):
 
 - **Phase 1 — Discovery & Modeling (S1–S3)**: map the attack surface and build a
   threat-aware plan.
@@ -47,10 +47,13 @@ around that constraint. The primary effectiveness metric is **Mean Time to
 Adapt (MTTA)**: elapsed time from AI-discovered exploitability to a validated
 fix in production.
 
-Multi-model by design, VVAH works with Anthropic Claude, OpenAI-compatible
-models, or a combination via a vendor-neutral abstraction layer. No single
-provider is a hard dependency, although current remediation and validation
-capabilities require Anthropic models for full functionality.
+Multi-model by design, VVAH supports Anthropic Claude and OpenAI-compatible
+models across the detection pipeline (S1–S9), and extends remediation (S10)
+and validation (S11) to OpenAI-compatible and open-weight models served via
+Chat Completions-compatible endpoints. These stages can be wired to different
+providers via a vendor-neutral abstraction layer. No single provider is a hard
+dependency. See [docs/models.md](docs/models.md) for the full model/backend
+matrix.
 
 For setup, see [`docs/SETUP_GUIDE.md`](docs/SETUP_GUIDE.md). This repository is
 not currently accepting external code contributions; see
@@ -59,9 +62,15 @@ not currently accepting external code contributions; see
 > **Authorized use only.** Run scans only against code you own or have explicit
 > permission to test. Findings and fixes are LLM-generated triage candidates
 > that require human review — see [Limitations](#limitations-read-before-you-trust-output).
+>
+> **Data egress warning.** Any role routed to `via: sdk`, `via: openai`, or
+> `via: deepagents` sends prompt data to that model provider endpoint
+> (Anthropic/OpenAI or your configured gateway). Use only approved endpoints
+> and scan targets you are authorized to process.
 
 **Docs:** [SETUP_GUIDE.md](docs/SETUP_GUIDE.md) — install & configuration ·
 [USER_GUIDE.md](docs/USER_GUIDE.md) — commands & options ·
+[models.md](docs/models.md) — model/backend selection ·
 [remediation.md](docs/remediation.md) · [validation.md](docs/validation.md) ·
 [Project Glasswing white paper](https://corporate.visa.com/content/dam/VCOM/corporate/visa-perspectives/security-and-trust/documents/project-glasswing.pdf) — technical background.
 
@@ -70,6 +79,42 @@ not currently accepting external code contributions; see
 cloud, identity, supply-chain, detection, response, and post-scan assurance ·
 [Codex-Only Direction](codex/README.md) — native Codex backend plan,
 authentication boundary, implementation milestones, efficiency, and safety.
+
+---
+
+## Features
+
+- **S0–S11 pipeline** — optional static AST/callgraph seed, then threat-modeled
+  discovery, multi-lens deep-dive, adversarial verification, dedup, exploit-chain
+  synthesis, remediation, and adversarial fix validation.
+- **AST/call-graph seeding (S0/S1)** — tree-sitter-backed static analysis builds
+  a source→sink callgraph seed (S0) and an AST-exact call graph (S1), focusing
+  later-stage analysis on reachable code paths rather than the whole repo.
+- **4 backends** (`via: cli` / `sdk` / `openai` / `deepagents`) — mix per role,
+  swap without code changes.
+- **DeepAgents runtime** — the shared, model-agnostic backend for S10
+  remediation and S11 validation; the same harness routes to either the
+  Anthropic or OpenAI provider per role.
+- **Majority-vote FP filtering** — N runs at T>0 on the `sdk`/`openai` backends;
+  a finding must survive ≥ threshold runs to be kept.
+- **Taint analysis** — interprocedural, field/container, and reflection-aware
+  data-flow tracking for Python, Java, and C#.
+- **6 cross-cutting specialist lenses** (crypto, logic-bug, access-control,
+  batch/ETL, IaC, deserialization) — auto-gated to matching attack surface.
+- **Structured output** — Markdown report + SARIF 2.1.0, CVSS 3.1 + CMDB-aware
+  scoring, and CWE taxonomy mapping.
+- **Automated remediation + validation** — `remediate` proposes (and in fix
+  mode applies) a fix per finding; `validate` runs an agentic adversarial panel
+  to grade those fixes.
+- **Batch scanning** — clone and scan many repos from a CSV, one report per
+  AppId; resumable via a SQLite checkpoint DB.
+- **Harness observability** — `scan_progress` is an optional real-time
+  file/chunk-level `[progress]` view streamed to stderr across S0–S9 (compact,
+  verbose, or summary-only); it has no impact on scan results or data
+  handling. See [docs/USER_GUIDE.md → Observability](docs/USER_GUIDE.md#observability).
+
+See [docs/capabilities.md](docs/capabilities.md) (one-page reference) and
+[docs/features.md](docs/features.md) (full detail) for more.
 
 ---
 
@@ -95,13 +140,17 @@ New here? Follow [Install](#install) → [Configure](#configure) → [Run](#run)
 
 VVAH implements an eleven-stage pipeline across four phases.
 
-### Detection pipeline (`scan`, S1–S9)
+### Detection pipeline (`scan`, S0–S9)
+
+S0 is an **optional** static seed stage (`step0`) used by the shipped
+`taint.yaml` profile. The packaged `default.yaml` starts at S1.
 
 Nine detection stages combine deterministic controls with frontier-model
 reasoning to produce structured, exploit-validated findings.
 
 | Stage group | Stages | Purpose |
 |---|---|---|
+| Static seed (optional) | S0 | Source/sink callgraph seed for taint-first scanning |
 | Discovery & Modeling | S1–S3 | Attack surface mapping, threat modeling, hunting plan |
 | Deep Dive & Verification | S4–S6 | Multi-lens research, policy gates, adversarial verification |
 | Synthesis, Chaining & Reporting | S7–S9 | Deduplication, chain construction, SARIF emission |
@@ -165,13 +214,13 @@ and [`docs/remediation.md`](docs/remediation.md) /
 
 ## Requirements
 
-- **Python ≥ 3.10**
-- An LLM credential — a Claude Code login (run `claude` then `/login`) for the
-  default profile, **or** an Anthropic API key (`ANTHROPIC_SDK_API_KEY`) /
-  `OPENAI_API_KEY` if you switch roles to `via: sdk` / `via: openai`; see
-  [Configure](#configure).
-- The `claude` CLI — required for the default profile (every role `via: cli`);
-  optional otherwise.
+- **Python ≥ 3.11**
+- LLM credentials for the profile you run. For `default.yaml`: Claude Code
+  login for S1–S9, and `ANTHROPIC_API_KEY` for S10 and S11.
+  For `sdk.yaml`: `ANTHROPIC_SDK_API_KEY`. For mixed/custom routing, provide
+  credentials for each backend in use; see [Configure](#configure).
+- The `claude` CLI — required for S1–S9 in the default profile (`via: cli`);
+  optional for all-SDK profiles.
 
 ---
 
@@ -207,6 +256,8 @@ Anthropic SDK and OpenAI backends need only an API key, but the **Claude CLI
 backend used by the default profile also requires the external `claude` CLI to
 be installed separately** (see [Requirements](#requirements)).
 
+The tree-sitter parsers used by taint seeding (`tree-sitter` + `tree-sitter-language-pack`) are included in the default install — no extra flag needed.
+
 ---
 
 ## Configure
@@ -238,14 +289,24 @@ Which credential you need depends on the backend each role uses:
 - **`via: openai`** — set `OPENAI_API_KEY` (and `OPENAI_BASE_URL` for an
   OpenAI-compatible endpoint).
 
-The default profile (`vvaharness/config/profiles/default.yaml`) runs detection
-stages (S1–S8) through the `claude` CLI, with the remediation (S10) and
-validation (S11) roles pinned to a higher-tier model — all `via: cli`, so your
-Claude Code login is enough, no SDK key required. (`sdk.yaml` runs the same
-roles via the Anthropic SDK instead — set `ANTHROPIC_SDK_API_KEY` — and turns
-on S4 majority voting.) To use the multi-backend layout (Claude CLI +
+The default profile (`vvaharness/config/profiles/default.yaml`) is a mixed-backend
+layout:
+
+| Stages | Backend | Credential needed |
+|---|---|---|
+| S1–S9 (detection) | `via: cli` | Claude Code login (`claude` then `/login`, or `CLAUDE_CODE_OAUTH_TOKEN`) |
+| S10 remediate | `via: deepagents`, `provider: anthropic` | `ANTHROPIC_API_KEY` |
+| S11 validate | `via: deepagents`, `provider: anthropic` | `ANTHROPIC_API_KEY` |
+
+No shipped profile runs the full S1–S11 pipeline on a Claude Code login alone.
+`sdk.yaml` covers S1–S11 with a single `ANTHROPIC_SDK_API_KEY` (all roles
+`via: sdk`; also enables S4 majority voting). `taint.yaml` is login-only but
+ships with S10/S11 disabled. To use the multi-backend layout (Claude CLI +
 Anthropic SDK + OpenAI roles), copy `vvaharness/config/profiles/full.yaml` to
 `./config.yaml` and edit it.
+
+For source→sink callgraph scanning, use the shipped `taint.yaml` profile:
+`vvaharness/config/profiles/taint.yaml`.
 
 For a step-by-step walkthrough — picking a profile, config resolution order,
 secrets in `.env`, and copy-then-edit customization — see
@@ -287,9 +348,9 @@ never applies a patch, and runs no Docker. Re-runs are idempotent.
 vvaharness validate --repo /path/to/target
 ```
 
-Validation is **Anthropic-only** (`models.validate` must run `via: cli` or
-`via: sdk`); a `via: openai` validate role is refused (the validate step aborts
-with exit code 2). For the panel personas, weighted gates, and verdict
+Validation runs on a Harness backend (`via: cli`, `via: sdk`, or `via: deepagents`);
+a legacy `via: openai` role is routed to `via: deepagents` with the OpenAI provider,
+so it works without a profile change. For the panel personas, weighted gates, and verdict
 thresholds, see [`docs/validation.md`](docs/validation.md) and
 [`docs/remediation.md`](docs/remediation.md).
 
@@ -346,14 +407,29 @@ a SQLite state DB at `$VVAHARNESS_STATE_DIR/vvaharness.db` (default
   against untrusted or malicious input may expose host credentials, API keys,
   and sensitive files. If you must scan a less-trusted target, see
   [`docs/security.md` → Hardening for less-trusted or sensitive targets](docs/security.md#hardening-for-less-trusted-or-sensitive-targets).
-- **Validation (S11) is Anthropic-only.** The validation panel runs only on
-  Anthropic models (`via: cli` or `via: sdk`); a `via: openai` validate role is
-  refused.
-- **Remediation fix mode is effectively Anthropic-only.** Applying a fix needs
+- **Validation (S11) needs a Harness backend.** The panel runs on `via: cli`,
+  `via: sdk`, or `via: deepagents`; a legacy `via: openai` validate role is routed
+  to `via: deepagents` with the OpenAI provider rather than refused.
+- **Remediation fix mode is effectively.** Applying a fix needs
   the agent's file-mutation tools (`Edit`/`Write`), which only the `via: cli`
   and `via: sdk` backends expose; the OpenAI-compatible backend is sandboxed to
   Read/Glob/Grep and **cannot edit files**. A `via: openai` `models.remediate`
   role therefore can only run `--mode report-only`.
+- **Missing post-scan credentials are a warning, not a fatal error.** If
+  `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is absent but only required by S10
+  (remediate) or S11 (validate), preflight emits a `WARN` and skips that stage —
+  S1–S9 detection still runs. Missing credentials for detection roles remain fatal.
+- **`via: deepagents` is only valid for `models.remediate` and `models.validate`.**
+  Configuring it for any S1–S9 detection role causes an immediate exit before
+  any tokens are spent.
+- **In-scan S11 validation is budget-capped; standalone `validate` is not.**
+  In-scan S11 applies `step_validate.max_findings` (top-N by CVSS score);
+  `vvaharness validate --all` bypasses this cap and re-validates all findings.
+- **Structured taint evidence is Python, Java, and C# only.** For all other
+  languages the callgraph engine falls back to reachability-based seed paths
+  with no typed transfer edges, no sanitizer neutralization, no framework-source
+  detection, and no reflection tracking. LLM stages still run; taint evidence
+  just won't be present in the prompt context.
 - **Review remediation fixes before you rely on them.** The remediation agent
   proposes — and in fix mode applies — code changes, but VVAH does **not**
   compile, build, or run tests against the patched tree. Always review the

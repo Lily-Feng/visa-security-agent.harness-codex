@@ -112,18 +112,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--resume", action="store_true",
                     help="reuse existing checkpoints for completed steps")
     ap.add_argument("--stop-after",
-                    choices=["clone", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-                             "s8", "s9", "s10", "s11"],
+                    choices=["clone", "s0", "s1", "s2", "s3", "s4", "s5", "s6",
+                             "s7", "s8", "s9", "s10", "s11"],
                     help="stop after the named step (for debugging); "
                          "'clone' stops right after acquiring repos in batch "
                          "mode and implies --keep-clones")
     ap.add_argument("--remediate", action="store_true",
-                    help="run step 10: the Remediation Agent proposes a fix "
-                         "for each verified finding and writes per-finding "
-                         "artefacts under <repo>/security-remediation/ (also "
-                         "enabled via step_remediate.enabled in config)")
+                    help="run step 10 in fix mode: the Remediation Agent can "
+                         "apply a fix to selected verified findings and writes "
+                         "per-finding artefacts under "
+                         "<repo>/security-remediation/ (also enabled via "
+                         "step_remediate.enabled in config)")
     ap.add_argument("--top", type=_top_arg, default=None, metavar="N|all",
-                    help="with --remediate: override step_remediate.top_n_findings "
+                    help="when step 10 is enabled: override "
+                         "step_remediate.top_n_findings "
                          "for this run — remediate only the N highest-CVSS "
                          "findings (limit & reorder, highest score first), or "
                          "pass 'all' / '*' to remediate every finding. The "

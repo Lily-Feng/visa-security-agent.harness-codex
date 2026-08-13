@@ -57,8 +57,12 @@ def _ranked(title: str, score: float, *, severity: str = "HIGH"):
 @pytest.fixture
 def cfg():
     # top_n_findings None → no profile cap; tests pass an explicit --top where
-    # the cap itself is under test.
-    return SimpleNamespace(step_remediate=SimpleNamespace(top_n_findings=None))
+    # the cap itself is under test. Provide a minimal models.remediate spec so
+    # the orchestrator backend resolution succeeds.
+    return SimpleNamespace(
+        step_remediate=SimpleNamespace(top_n_findings=None),
+        models=SimpleNamespace(remediate=SimpleNamespace(id="claude-opus-4-8", via="cli")),
+    )
 
 
 def _capture_process_findings(monkeypatch):
@@ -194,12 +198,23 @@ def test_remediate_one_isolates_failure(tmp_path, monkeypatch):
 # ─────────────────────────── preflight gate ─────────────────────────────────
 # _remediate_preflight is the call-site gate (scan.py) that decides whether the
 # in-pipeline remediation step runs at all — independent of the loop above. It
-# refuses when no models.remediate role is configured, or when HEAD moved since
-# the scan report was built (stale line numbers → a patch would land on the
-# wrong code), unless --force overrides.
+# refuses when no models.remediate role is configured, when that role's backend
+# credential is missing (startup preflight only WARNs on a post-scan gap, so this
+# is where it becomes a skip), or when HEAD moved since the scan report was built
+# (stale line numbers → a patch would land on the wrong code), unless --force
+# overrides.
 
 def _report(git_sha=None):
     return SimpleNamespace(findings=[], git_sha=git_sha)
+
+
+def _credential(monkeypatch, ready=True, detail="credential present"):
+    """Pin the backend-credential answer so the HEAD/role cases below exercise only
+    their own logic. Patched on the environment module because _remediate_preflight
+    imports the helper at call time (circular-import avoidance)."""
+    from vvaharness.util import environment
+    monkeypatch.setattr(environment, "_backend_credential_ok",
+                        lambda *_a, **_k: (ready, detail))
 
 
 def test_preflight_blocks_when_remediate_role_missing(tmp_path):
@@ -209,26 +224,39 @@ def test_preflight_blocks_when_remediate_role_missing(tmp_path):
     assert err and "models.remediate" in err
 
 
-def test_preflight_blocks_when_head_moved(tmp_path, monkeypatch):
-    cfg = SimpleNamespace(models=SimpleNamespace(remediate={"id": "x"}))
+def test_preflight_blocks_when_credential_missing(tmp_path, monkeypatch):
+    """A credential gap disables s10 (scan continues) instead of aborting."""
+    cfg = SimpleNamespace(models=SimpleNamespace(remediate="x"))
     args = SimpleNamespace(force=False)
-    monkeypatch.setattr(scan, "_head_sha", lambda repo: "b" * 40)
+    _credential(monkeypatch, ready=False, detail="`claude` CLI not on PATH")
+    monkeypatch.setattr(scan, "_head_sha", lambda _repo: "a" * 40)
+    err = scan._remediate_preflight(cfg, args, tmp_path, _report(git_sha="a" * 40))
+    assert err and "via:cli" in err and "not on PATH" in err
+
+
+def test_preflight_blocks_when_head_moved(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(models=SimpleNamespace(remediate="x"))
+    args = SimpleNamespace(force=False)
+    _credential(monkeypatch)
+    monkeypatch.setattr(scan, "_head_sha", lambda _repo: "b" * 40)
     err = scan._remediate_preflight(cfg, args, tmp_path, _report(git_sha="a" * 40))
     assert err and "HEAD moved" in err
 
 
 def test_preflight_head_move_overridden_by_force(tmp_path, monkeypatch):
-    cfg = SimpleNamespace(models=SimpleNamespace(remediate={"id": "x"}))
+    cfg = SimpleNamespace(models=SimpleNamespace(remediate="x"))
     args = SimpleNamespace(force=True)
-    monkeypatch.setattr(scan, "_head_sha", lambda repo: "b" * 40)
+    _credential(monkeypatch)
+    monkeypatch.setattr(scan, "_head_sha", lambda _repo: "b" * 40)
     assert scan._remediate_preflight(
         cfg, args, tmp_path, _report(git_sha="a" * 40)) is None
 
 
 def test_preflight_passes_when_sha_matches(tmp_path, monkeypatch):
-    cfg = SimpleNamespace(models=SimpleNamespace(remediate={"id": "x"}))
+    cfg = SimpleNamespace(models=SimpleNamespace(remediate="x"))
     args = SimpleNamespace(force=False)
-    monkeypatch.setattr(scan, "_head_sha", lambda repo: "a" * 40)
+    _credential(monkeypatch)
+    monkeypatch.setattr(scan, "_head_sha", lambda _repo: "a" * 40)
     assert scan._remediate_preflight(
         cfg, args, tmp_path, _report(git_sha="a" * 40)) is None
 # END GENAI

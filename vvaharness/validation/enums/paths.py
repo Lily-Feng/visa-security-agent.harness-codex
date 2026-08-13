@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from vvaharness.validation.enums._compat import StrEnum
+from enum import StrEnum
 
 __all__ = ["ValidationPath"]
 

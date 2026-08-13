@@ -40,9 +40,9 @@ def test_inject_raises_when_rules_source_missing(
         config_inject.inject_claude_config(workspace)
 
 
-def test_inject_succeeds_with_rules_present_and_skills_absent(tmp_path: Path) -> None:
-    # The packaged config ships rules/ but no skills/; injection succeeds and copies rules/,
-    # while the optional skills/ subtree is simply not created.
+def test_inject_succeeds_with_rules_present_and_skills_optional(tmp_path: Path) -> None:
+    # rules/ is required; skills/ is optional at the source but, when present, is
+    # copied into the workspace. The scoring package stays host-side.
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
@@ -50,6 +50,7 @@ def test_inject_succeeds_with_rules_present_and_skills_absent(tmp_path: Path) ->
 
     dest_claude = workspace / CLAUDE_DIRNAME
     assert (dest_claude / "rules").is_dir()
-    assert not (dest_claude / "skills").exists()
+    if (config_inject.CLAUDE_CONFIG_SOURCE / "skills").exists():
+        assert (dest_claude / "skills").is_dir()
     # scoring is computed host-side; the package is not copied into the workspace.
     assert not (workspace / "scoring").exists()

@@ -18,16 +18,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import NotRequired
 
-from typing_extensions import NotRequired, TypedDict
+# TypedDict stays on typing_extensions: pydantic requires its variant below 3.12.
+from typing_extensions import TypedDict
 
 from vvaharness.validation.enums.gates import GateName, GateStatus
 from vvaharness.validation.enums.readiness import MergeReadiness
 from vvaharness.validation.enums.verdicts import FixVerdict
-
-if TYPE_CHECKING:
-    pass
 
 __all__ = [
     "EvidenceAnchor",

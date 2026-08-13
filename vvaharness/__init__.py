@@ -20,4 +20,4 @@ try:
     # so the CLI banner can never drift from the released version again.
     __version__ = _pkg_version("vvaharness")
 except PackageNotFoundError:  # running from a source tree that isn't pip-installed
-    __version__ = "1.1.0"
+    __version__ = "1.2.0"

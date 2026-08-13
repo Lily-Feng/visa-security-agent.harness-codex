@@ -64,6 +64,12 @@ def test_md_cell_neutralises_pipe_and_newline() -> None:
     assert _md_cell(123) == "123"
 
 
+def test_md_cell_escapes_backslash_before_pipe() -> None:
+    # A supplied "\" must be doubled, else it consumes the escape added for "|" and the
+    # raw delimiter survives into the rendered summary table.
+    assert _md_cell(r"a\|b") == r"a\\\|b"
+
+
 def test_pipe_in_appid_cannot_forge_or_shift_cells() -> None:
     # An AppID that tries to inject extra columns and flip a FAILED status to OK.
     evil = "x | OK | 0 | 0 | | "

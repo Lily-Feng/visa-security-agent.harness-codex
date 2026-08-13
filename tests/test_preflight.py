@@ -19,9 +19,12 @@ max_tokens cap surfaces as an error, yet it is reachable — the probe must coun
 it as a pass. Genuine credential/connectivity failures must still fail. No real
 network or subprocess: the probe call and model-role resolution are monkeypatched.
 """
+from types import SimpleNamespace
+
 import pytest
 
 from vvaharness import orchestrator
+from vvaharness.orchestrator import preflight as pf
 import vvaharness.backends.llm as llm
 
 
@@ -147,3 +150,143 @@ def test_agentic_probe_skips_prompt_only_roles(monkeypatch):
     monkeypatch.setattr(llm, "agentic", rec)
     assert orchestrator.preflight.probe_backends(cfg=object()) is True
     assert calls["n"] == 0  # agentic() never probed for prompt-only roles
+
+
+def test_deepagents_role_uses_hoisted_harness_probe(monkeypatch):
+    from vvaharness.backends import harness as harness_pkg
+
+    monkeypatch.setattr(
+        orchestrator.preflight, "_iter_model_roles",
+        lambda cfg: [("remediate", SimpleNamespace(id="gpt-5.5", via="deepagents"))],
+    )
+    monkeypatch.setattr(
+        orchestrator.preflight, "resolve_model",
+        lambda model: ("gpt-5.5", "deepagents", {}),
+    )
+    monkeypatch.setattr(
+        llm, "prompt",
+        lambda *args, **kwargs: pytest.fail("legacy dispatcher was called"),
+    )
+    captured = {}
+
+    class FakeHarness:
+        async def run_oneshot(self, prompt, options):
+            captured["prompt"] = prompt
+            captured["options"] = options
+            return SimpleNamespace(is_error=False, subtype="success")
+
+    monkeypatch.setattr(harness_pkg, "get_harness", lambda via: FakeHarness())
+    assert orchestrator.preflight.probe_backends(cfg=object()) is True
+    assert captured["options"].model == "gpt-5.5"
+    assert captured["options"].allow_writes is False
+
+
+def test_deepagents_is_rejected_for_scan_roles(monkeypatch, capsys):
+    monkeypatch.setattr(
+        orchestrator.preflight, "_iter_model_roles",
+        lambda cfg: [("deepdive", SimpleNamespace(id="gpt-5.5", via="deepagents"))],
+    )
+    assert orchestrator.preflight.probe_backends(cfg=object()) is False
+    assert "unsupported role(s): deepdive" in capsys.readouterr().err
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Credential-gap classification — post-scan roles degrade, detection roles abort
+# ─────────────────────────────────────────────────────────────────────────────
+# S10/S11 are individually opt-in and run after detection finishes, so a missing
+# credential for one of them must not stop S1-S9 from running: preflight WARNs and
+# the scan's own [s10]/[s11] gates skip the stage. A credential shared with any
+# detection role stays fatal — a scan that cannot detect must not start.
+
+
+def _roles_on(monkeypatch, roles, via):
+    """Present exactly *roles*, all resolving to *via*, and neutralize the probe so
+    only the credential classification is under test."""
+    monkeypatch.setattr(
+        pf, "_iter_model_roles",
+        lambda _cfg: [(r, SimpleNamespace(id="test-model", via=via)) for r in roles])
+    monkeypatch.setattr(pf, "resolve_model",
+                        lambda _m: ("test-model", via, {}))
+    monkeypatch.setattr(pf, "probe_backends", lambda _cfg: True)
+    # Present a gateway so the JWT-without-base_url fast-fail can't short-circuit.
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://test-gateway.example/")
+
+
+def test_post_scan_only_cli_gap_warns_and_continues(monkeypatch, capsys):
+    _roles_on(monkeypatch, ["validate"], "cli")
+    monkeypatch.setattr(orchestrator.shutil, "which", lambda _name: None)
+
+    assert orchestrator.check_backends(cfg=object()) is True
+    err = capsys.readouterr().err
+    assert "WARN" in err and "will be skipped" in err
+    assert "ERROR" not in err
+
+
+def test_detection_role_cli_gap_still_aborts(monkeypatch, capsys):
+    _roles_on(monkeypatch, ["deepdive"], "cli")
+    monkeypatch.setattr(orchestrator.shutil, "which", lambda _name: None)
+
+    assert orchestrator.check_backends(cfg=object()) is False
+    assert "ERROR: `claude` CLI not found" in capsys.readouterr().err
+
+
+def test_gap_shared_with_detection_role_stays_fatal(monkeypatch, capsys):
+    """One credential, two consumers: the detection role decides."""
+    _roles_on(monkeypatch, ["deepdive", "validate"], "cli")
+    monkeypatch.setattr(orchestrator.shutil, "which", lambda _name: None)
+
+    assert orchestrator.check_backends(cfg=object()) is False
+    assert "ERROR: `claude` CLI not found" in capsys.readouterr().err
+
+
+def test_post_scan_deepagents_gap_warns_and_continues(monkeypatch, capsys):
+    from vvaharness.util import environment
+
+    _roles_on(monkeypatch, ["remediate", "validate"], "deepagents")
+    monkeypatch.setattr(environment, "_backend_credential_ok",
+                        lambda *_a, **_k: (False, "OPENAI_API_KEY not set"))
+
+    assert orchestrator.check_backends(cfg=object()) is True
+    err = capsys.readouterr().err
+    assert "WARN: DeepAgents test-model: OPENAI_API_KEY not set" in err
+    assert "remediate, validate" in err
+    assert "ERROR" not in err
+
+
+def test_probe_failure_on_post_scan_role_only_warns(monkeypatch, capsys):
+    """An unreachable model that only S10/S11 use degrades that stage, not the scan."""
+    monkeypatch.setattr(
+        pf, "_iter_model_roles",
+        lambda _cfg: [("validate", SimpleNamespace(id="test-model", via="sdk"))])
+    monkeypatch.setattr(pf, "resolve_model",
+                        lambda _m: ("test-model", "sdk", {}))
+
+    def boom(*_a, **_k):
+        raise RuntimeError("401 Invalid authentication credentials")
+
+    monkeypatch.setattr(llm, "prompt", boom)
+    assert pf.probe_backends(cfg=object()) is True
+    err = capsys.readouterr().err
+    assert "WARN" in err and "will be skipped" in err
+    assert "FAILED" not in err
+    # The closing summary must not contradict the WARN above it: an operator (or a
+    # log scraper) reading only the summary would otherwise conclude every backend
+    # was reachable when one was just reported unreachable.
+    assert "all model backends reachable" not in err
+    assert "detection backends reachable ✓" in err and "validate unreachable" in err
+
+
+def test_probe_summary_says_all_reachable_when_nothing_skipped(monkeypatch, capsys):
+    """The unqualified summary survives for a fully clean probe (guards the branch
+    order in probe_backends: a skipped-stage summary must not swallow this one)."""
+    monkeypatch.setattr(
+        pf, "_iter_model_roles",
+        lambda _cfg: [("deepdive", SimpleNamespace(id="test-model", via="sdk"))])
+    monkeypatch.setattr(pf, "resolve_model",
+                        lambda _m: ("test-model", "sdk", {}))
+    monkeypatch.setattr(llm, "prompt", lambda *_a, **_k: "ok")
+
+    assert pf.probe_backends(cfg=object()) is True
+    err = capsys.readouterr().err
+    assert "all model backends reachable ✓" in err
+    assert "WARN" not in err

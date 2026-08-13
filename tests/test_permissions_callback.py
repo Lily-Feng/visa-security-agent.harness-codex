@@ -23,8 +23,8 @@ from pathlib import Path
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
-from vvaharness.validation.backends.claude.options import _permissions_callback
-from vvaharness.validation.backends.contract.permissions import PermissionsPolicy
+from vvaharness.backends.harness.claude.options import _permissions_callback
+from vvaharness.backends.harness.contract.permissions import PermissionsPolicy
 
 
 def _decide(policy: PermissionsPolicy, tool: str, inp: dict):

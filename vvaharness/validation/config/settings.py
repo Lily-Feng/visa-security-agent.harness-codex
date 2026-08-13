@@ -40,6 +40,7 @@ from vvaharness.validation.constants.artifacts import (
     ENV_MAX_RETRIES,
     ENV_MAX_TURNS,
     ENV_MODEL,
+    ENV_MODEL_PROVIDER,
     ENV_PENETRATION_TESTER_MODEL,
     ENV_SECURITY_ARCHITECT_MODEL,
     ENV_VALIDATE_TOOLS,
@@ -64,8 +65,8 @@ class PathsConfig(BaseModel):
     prompts_dir: Path
 
 
-class ClaudeConfig(BaseModel):
-    """Claude model and agent-runtime knobs."""
+class AgentConfig(BaseModel):
+    """Agent runtime knobs: model selection, backend, execution limits."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -76,6 +77,7 @@ class ClaudeConfig(BaseModel):
     effort: EffortLevel = DEFAULT_EFFORT
     max_retries: int = DEFAULT_MAX_RETRIES
     via: str = DEFAULT_VIA
+    provider: str | None = None  # deepagents backend: openai|anthropic; None → infer
     # Optional per-persona model overrides for the s11 validator; None → inherit ``model``.
     security_architect_model: str | None = None
     penetration_tester_model: str | None = None
@@ -99,7 +101,7 @@ class Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     paths: PathsConfig
-    claude: ClaudeConfig = Field(default_factory=ClaudeConfig)
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     ghe: GheConfig = Field(default_factory=GheConfig)
     max_findings: int | None = DEFAULT_MAX_FINDINGS
     live: bool = False
@@ -120,6 +122,7 @@ class _EnvScalars(BaseSettings):
     max_retries: int = Field(default=DEFAULT_MAX_RETRIES, alias=ENV_MAX_RETRIES)
     binary: str = Field(default=DEFAULT_CLAUDE_BINARY, alias=ENV_CLAUDE_BINARY)
     via: str = Field(default=DEFAULT_VIA, alias=ENV_VIA)
+    provider: str | None = Field(default=None, alias=ENV_MODEL_PROVIDER)
     ghe_token: str = Field(default="", alias=ENV_GHE_TOKEN)
     ghe_archived_token: str = Field(default="", alias=ENV_GHE_ARCHIVED_TOKEN)
     security_architect_model: str | None = Field(default=None, alias=ENV_SECURITY_ARCHITECT_MODEL)
@@ -162,7 +165,7 @@ def load_config(
     root = project_root if project_root is not None else Path.cwd()
     cfg = Config(
         paths=_build_paths(root),
-        claude=ClaudeConfig(
+        agent=AgentConfig(
             binary=env.binary,
             model=env.model,
             max_turns=env.max_turns,
@@ -170,6 +173,7 @@ def load_config(
             effort=env.effort,
             max_retries=env.max_retries,
             via=env.via,
+            provider=env.provider,
             security_architect_model=env.security_architect_model,
             penetration_tester_model=env.penetration_tester_model,
             cross_repo_analyzer_model=env.cross_repo_analyzer_model,

@@ -16,21 +16,23 @@
 from __future__ import annotations
 
 """
-Agentic SAST — 10-stage LLM security pipeline (step 10 is opt-in remediation).
+Agentic SAST — profile-controlled S0 static seeding plus an S1-S11 workflow.
 
 Usage (via the `vvaharness` console script):
   vvaharness scan --repo /path/to/target [--config config.yaml]
                    [--resume] [--repo-name acme/payments] [--application-id ID]
                    [--remediate] [--top N]
 
-The default profile runs every role through the Claude CLI (`via: cli`) on
-claude-sonnet-4-6, reusing your Claude Code login (run `claude` then `/login`,
-or set CLAUDE_CODE_OAUTH_TOKEN) — no ANTHROPIC_SDK_API_KEY required. Roles can
-be re-pointed at the Anthropic SDK (`via: sdk`; auth: ANTHROPIC_SDK_API_KEY) or
-an OpenAI-compatible endpoint (`via: openai`; auth: OPENAI_API_KEY) in
-config.yaml.
+The shipped default runs S1-S9 through the Claude CLI (`via: cli`) on
+claude-sonnet-4-6, S10 through DeepAgents/Anthropic, and S11 through
+DeepAgents/OpenAI. The post-scan stages are enabled in that profile but are
+skipped with a warning when their provider credential is unavailable; use
+`--stop-after s9` for detection only. Other profiles can route detection roles
+to the Anthropic SDK (`via: sdk`) or an OpenAI-compatible endpoint
+(`via: openai`).
 
 Steps:
+  0. Static AST/callgraph seed (profile-controlled) → SeedPackage
   1. Pre-process (agentic exploration)      → ContextPackage
   2. Threat-model (consumes ctx)            → ThreatModel
   3. Decompose (1 run)                      → TaskManifest
@@ -40,10 +42,11 @@ Steps:
   7. Dedup + VulContextSeverity/Offensive   → (canonical[], dup_dropped[])
   8. Chain                                  → FinalReport (+ ScanMetrics)
   9. MD → SARIF                             → *_report.sarif
- 10. Remediate (opt-in) — Remediation Agent → <repo>/security-remediation/<NN_slug>/remediate_report.json
- 11. Validate  (opt-in) — s11 agentic panel → fills each DTO's validation block;
-                                               redacted session log kept alongside it as
-                                               security-remediation/<NN_slug>/validation_session_<finding>.jsonl
+ 10. Remediate (profile-controlled) — Remediation Agent → <repo>/security-remediation/<NN_slug>/remediate_report.json
+ 11. Validate  (profile-controlled) — s11 agentic panel → fills each DTO's validation block;
+                                               when source-log capture and persistence
+                                               succeed, a redacted transcript is retained
+                                               beside the DTO as validation_session_<finding>.jsonl
 
 The `vvaharness validate --repo <path> --all` command (or `s11`) runs after remediation.
 Both security-scan/ and security-remediation/ are preserved after workspace cleanup.
@@ -87,4 +90,3 @@ from vvaharness.orchestrator.preflight import (
 from vvaharness.orchestrator.scan import scan_repo as scan_repo
 from vvaharness.orchestrator.batch import run_batch as run_batch
 from vvaharness.orchestrator.entry import main as main
-

@@ -1,0 +1,339 @@
+# Copyright 2026 Visa, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ── taint-first profile ──────────────────────────────────────────────────────
+# Source→sink scanning with the callgraph engine. Its taint-oriented behavior:
+#   ① step0       — tree-sitter AST seed (also enabled by default.yaml). In
+#                   rules mode, configured source/sink YAML is the rule source;
+#                   the shipped blank paths produce no rule-based seeds.
+#   ② step1.mode  — with a non-empty S0 seed, gap_fill skips the agentic
+#                   explorer except for the narrow large-service escalation
+#                   predicate below; an empty seed uses agentic S1
+#   ③ step3       — catchall_mode: reachable_only; taint chunks function-sliced
+#   ④ step4       — confirm/refute prompt on taint chunks, single-run, Opus tier
+#   ⑤ report      — after S8, the Markdown appendix lists files excluded
+#                   from reachable-only catch-all review; S9 then emits SARIF
+#
+# A/B against default.yaml on the same repo:
+#   vvaharness scan --repo <r> --config vvaharness/config/profiles/default.yaml
+#   vvaharness scan --repo <r> --config vvaharness/config/profiles/taint.yaml
+#
+# S1–S9 backend notes mirror default.yaml; S10/S11 are disabled below.
+
+models:
+  autoexclude: {id: claude-sonnet-4-6, via: cli}
+  preprocess:  {id: claude-sonnet-4-6, via: cli}
+  threatmodel: {id: claude-sonnet-4-6, via: cli}
+  decompose:   {id: claude-sonnet-4-6, via: cli}
+  # Primary role for step0 callgraph annotator mode.
+  # Used when step0.callgraph_detection='llm'.
+  graph_annotate: {id: claude-sonnet-4-6, via: cli}
+  # Backward-compatible fallback role for older callgraph llm paths.
+  callgraph_creation: {id: claude-sonnet-4-6, via: cli}
+  # ④ taint chunks are confirm/refute. All chunk kinds (including taint)
+  #    use the deepdive role below.
+  deepdive:    {id: claude-opus-4-8, via: cli}
+  verify:      {id: claude-opus-4-8, via: cli}
+  dedup:       {id: claude-sonnet-4-6, via: cli}
+  chain:       {id: claude-sonnet-4-6, via: cli}
+  # Step 10 is disabled below. If enabled, it selects the configured top-N,
+  # can edit target source in fix mode, and writes security-remediation artefacts.
+  remediate:   {id: claude-opus-4-8,   via: cli}
+  # Step 11 is disabled below. If enabled, this via:cli Harness pins external
+  # `claude`; a persona left unset inherits the orchestrator's model.
+  validate:
+    orchestrator:        {id: claude-opus-4-8, via: cli}
+    security_architect:  {id: claude-opus-4-8}
+    penetration_tester:  {id: claude-sonnet-4-6}
+    cross_repo_analyzer: {id: claude-sonnet-4-6}
+
+sdk:
+  api_key: ${ANTHROPIC_SDK_API_KEY}
+  base_url:   ${ANTHROPIC_SDK_BASE_URL}
+  verify_ssl: true
+  ca_cert:     ${ANTHROPIC_SDK_CA_CERT}     # absolute CA path; direct SDK detection only
+  client_cert: ${ANTHROPIC_SDK_CLIENT_CERT} # absolute mTLS cert path; direct SDK detection only
+
+openai:
+  api_key:    ${OPENAI_API_KEY}
+  base_url:   ${OPENAI_BASE_URL}
+  verify_ssl: true
+  ca_cert:    ${OPENAI_CA_CERT}             # absolute CA path; direct via:openai only
+
+cli:
+  verify_ssl: true
+  ca_cert:    ${CLAUDE_CLI_CA_CERT}         # absolute CA path -> NODE_EXTRA_CA_CERTS
+  effort: high
+
+# ① ── Step 0 — Static seed (callgraph, offline, no external binary) ─────────
+# The callgraph engine reads external YAML artifacts when configured. In rules
+# mode, absent artifacts yield empty source/sink rule sets; there is no implicit
+# heuristic source/sink baseline.
+# No model, registry fetch, semgrep binary, SARIF, or proxy/CA setup is required.
+step0:
+  enabled: true
+  # Source/sink selection mode:
+  # - rules: load YAML sources/sinks below (deterministic + stable)
+  # - llm: two-pass annotator flow. First pass scans AST calls, second pass
+  #        classifies call fingerprints into source/sink specs.
+  #        If llm returns no usable specs or fails, runtime falls back to rules.
+  callgraph_detection: rules      # rules | llm
+  # LLM-specific knobs for annotator mode.
+  callgraph:
+    llm:
+      max_tokens: 16000
+      max_candidates: 400
+      max_batch_candidates: 150
+      min_source_confidence: 0.75
+      min_sink_confidence: 0.75
+      failure_mode: empty        # empty | fail
+      heuristic_supplement: true
+      min_sources: 1
+      min_sinks: 1
+      max_heuristic_specs: 10
+  # Optional generated corpora remain external so their source provenance and
+  # licenses stay explicit. Leave these unset for no external rules. To use your
+  # own artifacts, set ABSOLUTE paths (relative paths resolve against the
+  # caller's CWD, not the target repo).
+  sources_yaml: ${VVA_STEP0_SOURCES_YAML:-}
+  sinks_yaml:   ${VVA_STEP0_SINKS_YAML:-}
+
+step1:
+  # ② gap_fill: with a non-empty S0 seed, use that seed + deterministic file
+  #    walk + tree-sitter graph without an S1 model call unless ALL escalation
+  #    conditions hold: more than 500 source files, web-api/web-app/service
+  #    classification, at least 10 entry points, and fewer than 5 sinks. An
+  #    empty seed is falsey and takes the agentic S1 path. If no entry points or
+  #    sinks remain after S1, s3 reverts catchall_mode to `all`.
+  mode: gap_fill                    # full | gap_fill
+  call_graph: tree_sitter           # regex | tree_sitter — AST-exact def spans + caller resolution.
+                                    # Uses base install dependencies; auto-falls-back to regex if parsers are unavailable.
+  max_budget_usd: 5.0               # when S1 runs, forwarded only if the installed CLI supports --max-budget-usd
+  max_turns: 10
+  allowed_tools:
+    - Read
+    - Glob
+    - Grep
+  exclude_dirs:
+    - .vs
+    - .settings
+    - .vscode
+    - .idea
+    - node_modules
+  exclude_exts:
+    - .msi
+    - .nupkg
+    - .pdb
+    - .lib
+    - .aar
+    - .ser
+    - .pbix
+    - .p12
+    - .pfx
+    - .jks
+    - .der
+    - .cer
+    - .doc
+    - .docx
+    - .xls
+    - .xlsx
+    - .xlsm
+    - .bmp
+    - .sqlite
+    - .db
+  exclude_globs:
+    - "**/._*"
+  max_file_kb: 1024
+  call_graph_validate: true
+  call_graph_supplement: true
+  call_graph_rounds: 4
+  call_graph_max_targets: 3
+  config_dedup:
+    enabled: true
+    min_cluster_size: 5
+    keep_per_top_dir: true
+    promote_on_secret_hit: true
+    promote_on_insecure_value: true
+
+step2:
+  enabled: true
+  max_tokens: 64000
+  max_threats: 50
+  baseline: auto
+  max_doc_chars: 20000
+  max_manifest_chars: 4000
+  max_modules: 100
+  max_entry_points: 400
+  max_config_reps: 80
+  max_api_artefacts: 100
+
+step3:
+  max_tokens: 64000
+  timeout: 3600
+  taint_chunks: true
+  taint_max_hops: 10
+  taint_max_chunks: 120             # raised — taint chunks are now the primary vehicle
+  taint_files_per_hop: 5
+  pack_by: loc
+  chunk_token_budget: 180000
+  chunk_overhead_tokens: 80000
+  risk_chunk_loc: 10000
+  # ③ catch-all only over files reachable (fwd from any EntryPoint OR back from
+  #    any Sink) on the call graph. Unreachable files are listed in the report
+  #    appendix, not silently dropped. `all` = legacy behaviour.
+  catchall_enabled: true
+  catchall_mode: reachable_only     # all | reachable_only
+  # Fail open when reachable-only pruning is suspiciously sparse. Unsupported
+  # language files are intentionally treated as reachable, so this guard is
+  # for unexpectedly incomplete supported-language/cross-file graph coverage.
+  catchall_reachable_min_ratio: 0.5   # revert to `all` if <50% of eligible files are reachable
+  catchall_reachable_min_files: 0     # 0 = disabled (ratio guard is primary)
+  catchall_chunk_loc: 4000
+  catchall_max_files: 100
+  max_files_per_chunk: 80
+  # ③ function slicing: ship only the functions on the BFS path (+ neighbor
+  #    ctx) rather than whole files, to cut deep-dive tokens. Requires
+  #    call-graph def-spans. NOTE (see F32): this mode is resolved before the
+  #    chunk-size check in s4, so it applies to EVERY chunk kind (risk,
+  #    catch-all, specialist) — not only taint chunks. The whole-file fallback
+  #    is per-CHUNK, not per-node: if any one file in a chunk resolves a span,
+  #    other files in that same chunk with no resolved span are emitted as
+  #    their first `step4.frontier_fallback_head_lines` (80) lines, and a
+  #    resolved file past `step4.frontier_max_funcs_per_file` (24) loses the
+  #    tail. Use `file` for guaranteed whole-file coverage.
+  taint_chunk_slice: function       # file | function
+  specialists:
+    - crypto
+    - logic-bug
+    - access-control
+    - batch-etl
+    - iac
+  specialist_chunk_loc: 10000
+  threat_surface_fallbacks: true    # add deterministic threat-tagged fallback chunks when threats remain uncovered
+  threat_fallback_max_files: 12     # per-threat file cap for fallback chunk candidate selection
+
+step4:
+  parallel: 5
+  timeout: 1800
+  # ④ taint chunks: 1 run, confirm/refute the seeded (CWE, source, sink).
+  #    risk/specialist chunks would use majority-vote, but every role here is
+  #    via: cli — the Claude CLI has no temperature control, so s4's
+  #    _effective_runs forces runs=1 anyway (see s4_deepdive.py). Keeping
+  #    runs=1 avoids the [s4] WARN that fires when runs>1 on via:cli. For
+  #    true majority voting, switch deepdive to via: sdk (see sdk.yaml).
+  runs: 1
+  taint_runs: 1
+  taint_prompt_mode: confirm_refute # discover | confirm_refute
+  vote_threshold: 1
+  specialist_runs: 1
+  line_bucket: 10
+  max_findings_per_run: 10
+  max_tokens: 64000
+  neighbor_context_lines: 25
+  neighbor_context_max: 50
+
+step5_prefilter:
+  min_pre_confidence: 0.6
+  require_evidence: true
+
+step6_verify:
+  parallel: 5
+  min_confidence: 7
+  max_budget_usd: 10.0              # forwarded only if the installed CLI supports --max-budget-usd
+  max_turns: 30
+  allowed_tools:
+    - Read
+    - Glob
+    - Grep
+
+step7_dedup:
+  line_tolerance: 3
+  semantic: true
+  max_tokens: 64000
+
+step8:
+  max_tokens: 64000
+  timeout: 3600
+
+
+step_remediate:
+  enabled: false
+  enforce_policy: true
+  # Optional rule overrides; null uses the files bundled with the installation.
+  #policy_file: null
+ # playbook_file: null
+  top_n_findings: 5
+  max_budget_usd: 10.0              # per-finding value forwarded to compatible CLI builds if enabled
+  max_turns: 40                     # per-finding CLI-agent turn cap if enabled
+  allowed_tools:
+    - Read
+    - Glob
+    - Grep
+    - Edit
+    - Write
+
+    
+step_validate:
+  enabled: false
+  effort: high                      # Claude Agent SDK reasoning effort if enabled
+  max_turns: 50                     # validation-panel turn cap if enabled
+  max_budget_usd: 15.0              # validation-panel spend cap if enabled
+  max_findings: 20
+  allowed_tools:
+    - Read
+    - Grep
+    - Glob
+
+inject:
+  # Optional external context. Relative paths resolve against this profile's
+  # directory, not the target repo; use absolute paths in a copied profile.
+  # Missing files safely mean no injected CVEs, controls, or CMDB context.
+  cve_file:      ./inputs/known_cves.json
+  controls_file: ./inputs/design_controls.yaml
+  cmdb_file:     ./inputs/cmdb.csv
+  # Remediation policy/playbook overrides (read by step_remediate's policy gate).
+  # Paths resolve against this config's directory; unset = bundled repo-root inputs/.
+  policy_file:    ./inputs/remediation_policy.yaml
+  playbook_file:  ./inputs/remediation_playbook.yaml
+batch:
+  git_token: ${GITHUB_TOKEN}
+  git_base_url: ${GIT_BASE_URL}
+  skip_repo_patterns:
+    - "*automation*"
+    - "*-playwright*"
+    - "*-selenium*"
+    - "*-karate*"
+    - "*perf-script*"
+    - "*perf-test*"
+    - "*test-buddy*"
+    - "*-e2e*"
+    - "*-mock-*"
+
+output:
+  preserve_on_cleanup: [security-scan, security-remediation]
+  # ⑤ list files excluded from reachable-only catch-all review. The appendix
+  #    is rendered with the Markdown report after S8, before S9 emits SARIF.
+  emit_unreachable_appendix: true
+
+scan_progress:
+  # ── Real-time file/chunk-level progress tracking ────────────────────────
+  # Emits S0-S9 stage lifecycle lines plus detailed S1 discovery, S2 notes,
+  # S3 queueing, and S4 chunk/result/summary lines to stderr. Report output is
+  # unaffected.
+  #
+  # Environment variable override: VVAHARNESS_SCAN_PROGRESS_ENABLED=1
+  enabled: true
+  # compact: lifecycle lines plus notable file lists; verbose: every file;
+  # summary_only: only the final S4 summary block (which may span several lines).
+  style: verbose    # compact | verbose | summary_only

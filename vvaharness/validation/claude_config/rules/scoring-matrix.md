@@ -67,7 +67,7 @@ Partially Fixed.
 
 ## Scoring Execution
 
-The orchestrator writes synthesized gates to `synthesized_gates.json` (via the Write tool) and then **computes the verdict directly from this matrix** — there is no Bash/shell in the session, so do the arithmetic yourself. Apply this exact algorithm (it mirrors the canonical scoring engine):
+The orchestrator returns its synthesized gates in its structured response — it has no Write tool and the host persists them — and **computes the verdict directly from this matrix** — there is no Bash/shell in the session, so do the arithmetic yourself. Apply this exact algorithm (it mirrors the canonical scoring engine):
 
 1. **Validate the gate set.** Exactly the four gates `root_cause`, `instance_coverage`, `no_new_vulnerabilities`, `security_best_practices` must be present, each exactly once. Any missing or duplicated gate → `fix_status = UNVERIFIABLE`, `raw_score = 0.0`, `gate_scores = {}` — stop here.
 2. **Per-gate weighted score (evaluated gates only).** A `skip` gate is *unevaluated* — exclude it from BOTH numerator and denominator (weight-neutral). An `invalid` gate (any non-str or unrecognised status) is *evaluated* but scores 0.0 and its weight IS counted in the denominator (fail-closed, not weight-neutral). For each evaluated gate (`pass`/`partial`/`fail`/`invalid`): `weighted_score = weight × status_multiplier` (`pass=1.0`, `partial=0.5`, `fail=0.0`, `invalid=0.0`). Round each to 4 decimal places (this is the per-gate value shown in `gate_scores`).

@@ -27,11 +27,14 @@ The schema is created idempotently on every ``connect()`` — there is no
 file is simply orphaned.
 """
 from __future__ import annotations
+from collections import defaultdict
+import hashlib
+import json
 import os
 import sqlite3
 from pathlib import Path
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 # auto_vacuum MUST precede the first CREATE TABLE or it is silently ignored;
 # journal_mode=WAL persists once set. foreign_keys / busy_timeout /
@@ -58,7 +61,124 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   PRIMARY KEY (run_id, step)
 );
 
+CREATE TABLE IF NOT EXISTS callgraph_snapshots (
+    run_id            TEXT    NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    graph_id          TEXT    NOT NULL,
+    node_count        INTEGER NOT NULL DEFAULT 0,
+    edge_count        INTEGER NOT NULL DEFAULT 0,
+    entry_point_count INTEGER NOT NULL DEFAULT 0,
+    sink_count        INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (run_id, graph_id)
+);
+
+CREATE TABLE IF NOT EXISTS callgraph_nodes (
+    run_id                 TEXT    NOT NULL,
+    graph_id               TEXT    NOT NULL,
+    qnode                  TEXT    NOT NULL,
+    file_path              TEXT    NOT NULL DEFAULT '',
+    function_name          TEXT    NOT NULL DEFAULT '',
+    start_line             INTEGER NOT NULL DEFAULT 0,
+    end_line               INTEGER NOT NULL DEFAULT 0,
+    is_entry_point         INTEGER NOT NULL DEFAULT 0,
+    entry_kind             TEXT    NOT NULL DEFAULT '',
+    reachable_from_unauth  INTEGER NOT NULL DEFAULT 0,
+    is_sink                INTEGER NOT NULL DEFAULT 0,
+    sink_line              INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, graph_id, qnode),
+    FOREIGN KEY (run_id, graph_id)
+        REFERENCES callgraph_snapshots(run_id, graph_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS callgraph_edges (
+    run_id        TEXT NOT NULL,
+    graph_id      TEXT NOT NULL,
+    caller_qnode  TEXT NOT NULL,
+    callee_qnode  TEXT NOT NULL,
+    PRIMARY KEY (run_id, graph_id, caller_qnode, callee_qnode),
+    FOREIGN KEY (run_id, graph_id)
+        REFERENCES callgraph_snapshots(run_id, graph_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS callgraph_stage_refs (
+    run_id      TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    step        TEXT NOT NULL,
+    graph_id    TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (run_id, step),
+    FOREIGN KEY (run_id, graph_id)
+        REFERENCES callgraph_snapshots(run_id, graph_id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS ix_runs_updated ON runs(updated_at);
+CREATE INDEX IF NOT EXISTS ix_callgraph_stage_refs_graph
+    ON callgraph_stage_refs(run_id, graph_id);
+CREATE INDEX IF NOT EXISTS ix_callgraph_nodes_file
+    ON callgraph_nodes(run_id, file_path, function_name);
+CREATE INDEX IF NOT EXISTS ix_callgraph_edges_caller
+    ON callgraph_edges(run_id, caller_qnode);
+CREATE INDEX IF NOT EXISTS ix_callgraph_edges_callee
+    ON callgraph_edges(run_id, callee_qnode);
+"""
+
+_DDL_V2 = """
+CREATE TABLE IF NOT EXISTS callgraph_snapshots (
+    run_id            TEXT    NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    graph_id          TEXT    NOT NULL,
+    node_count        INTEGER NOT NULL DEFAULT 0,
+    edge_count        INTEGER NOT NULL DEFAULT 0,
+    entry_point_count INTEGER NOT NULL DEFAULT 0,
+    sink_count        INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (run_id, graph_id)
+);
+
+CREATE TABLE IF NOT EXISTS callgraph_nodes (
+    run_id                 TEXT    NOT NULL,
+    graph_id               TEXT    NOT NULL,
+    qnode                  TEXT    NOT NULL,
+    file_path              TEXT    NOT NULL DEFAULT '',
+    function_name          TEXT    NOT NULL DEFAULT '',
+    start_line             INTEGER NOT NULL DEFAULT 0,
+    end_line               INTEGER NOT NULL DEFAULT 0,
+    is_entry_point         INTEGER NOT NULL DEFAULT 0,
+    entry_kind             TEXT    NOT NULL DEFAULT '',
+    reachable_from_unauth  INTEGER NOT NULL DEFAULT 0,
+    is_sink                INTEGER NOT NULL DEFAULT 0,
+    sink_line              INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, graph_id, qnode),
+    FOREIGN KEY (run_id, graph_id)
+        REFERENCES callgraph_snapshots(run_id, graph_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS callgraph_edges (
+    run_id        TEXT NOT NULL,
+    graph_id      TEXT NOT NULL,
+    caller_qnode  TEXT NOT NULL,
+    callee_qnode  TEXT NOT NULL,
+    PRIMARY KEY (run_id, graph_id, caller_qnode, callee_qnode),
+    FOREIGN KEY (run_id, graph_id)
+        REFERENCES callgraph_snapshots(run_id, graph_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS callgraph_stage_refs (
+    run_id      TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    step        TEXT NOT NULL,
+    graph_id    TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (run_id, step),
+    FOREIGN KEY (run_id, graph_id)
+        REFERENCES callgraph_snapshots(run_id, graph_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_callgraph_stage_refs_graph
+    ON callgraph_stage_refs(run_id, graph_id);
+CREATE INDEX IF NOT EXISTS ix_callgraph_nodes_file
+    ON callgraph_nodes(run_id, file_path, function_name);
+CREATE INDEX IF NOT EXISTS ix_callgraph_edges_caller
+    ON callgraph_edges(run_id, caller_qnode);
+CREATE INDEX IF NOT EXISTS ix_callgraph_edges_callee
+    ON callgraph_edges(run_id, callee_qnode);
 """
 
 
@@ -103,7 +223,8 @@ def connect() -> sqlite3.Connection:
 def _migrate(con: sqlite3.Connection, have: int) -> None:
     if have == 0:
         con.executescript(_DDL)
-    # elif have < 2: con.execute("ALTER TABLE checkpoints ADD COLUMN ...")
+    elif have < 2:
+        con.executescript(_DDL_V2)
     con.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
     con.commit()
 
@@ -129,6 +250,258 @@ def register_run(run_id: str, *, repo_root: str,
     con.close()
 
 
+def _qnode(file_path: str, function_name: str) -> str:
+    file_part = (file_path or "").replace("\\", "/")
+    fn_part = function_name or ""
+    return f"{file_part}::{fn_part}" if file_part or fn_part else ""
+
+
+def _split_qnode(qnode: str) -> tuple[str, str]:
+    # Split on the LAST "::" to match the canonical q_split in s1_preprocess
+    # (rpartition). File paths and qualified member names that themselves
+    # contain "::" (C++, C#) must decode identically on the SQLite persistence
+    # path and the in-memory path, or a hydrated graph points at the wrong file.
+    if "::" not in qnode:
+        return "", qnode
+    f, _, n = qnode.rpartition("::")
+    return f, n
+
+
+def _line_from_site(site: str) -> int:
+    _file, sep, raw = site.rpartition(":")
+    if not sep:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _graph_rows(obj) -> tuple[list[dict], list[tuple[str, str]]] | None:
+    call_graph = dict(getattr(obj, "call_graph", {}) or {})
+    call_graph_files = dict(getattr(obj, "call_graph_files", {}) or {})
+    def_spans = dict(getattr(obj, "def_spans", {}) or {})
+    entry_points = list(getattr(obj, "entry_points", ()) or ())
+    unsafe_sinks = list(getattr(obj, "unsafe_sinks", ()) or ())
+    if not (call_graph or call_graph_files or def_spans or entry_points or unsafe_sinks):
+        return None
+
+    entry_meta: dict[str, tuple[str, int]] = {}
+    for ep in entry_points:
+        qn = _qnode(getattr(ep, "file", ""), getattr(ep, "function", ""))
+        if qn:
+            entry_meta[qn] = (
+                (getattr(ep, "kind", "") or ""),
+                1 if bool(getattr(ep, "reachable_from_unauth", False)) else 0,
+            )
+
+    sink_meta: dict[str, int] = {}
+    for sink in unsafe_sinks:
+        qn = _qnode(getattr(sink, "file", ""), getattr(sink, "function", ""))
+        if qn:
+            line = int(getattr(sink, "line", 0) or 0)
+            prev = sink_meta.get(qn)
+            sink_meta[qn] = line if prev is None or (line and line < prev) else prev
+
+    qnodes: set[str] = set(call_graph)
+    edges: set[tuple[str, str]] = set()
+    for caller, callees in call_graph.items():
+        if not caller:
+            continue
+        qnodes.add(caller)
+        for callee in callees or ():
+            if not callee:
+                continue
+            qnodes.add(callee)
+            edges.add((caller, callee))
+    qnodes.update(qn for qn in entry_meta if qn)
+    qnodes.update(qn for qn in sink_meta if qn)
+    qnodes.update(qn for qn in def_spans if qn)
+
+    node_rows: list[dict] = []
+    for qn in sorted(qnodes):
+        file_path, function_name = _split_qnode(qn)
+        span = def_spans.get(qn) or []
+        start_line = int(span[0]) if len(span) >= 1 else 0
+        end_line = int(span[1]) if len(span) >= 2 else 0
+        if not start_line and function_name:
+            for site in call_graph_files.get(function_name, ()):
+                site_file, _, _raw = site.rpartition(":")
+                if site_file == file_path:
+                    start_line = _line_from_site(site)
+                    if not end_line:
+                        end_line = start_line
+                    break
+        entry_kind, unauth = entry_meta.get(qn, ("", 0))
+        sink_line = sink_meta.get(qn, 0)
+        node_rows.append({
+            "qnode": qn,
+            "file_path": file_path,
+            "function_name": function_name,
+            "start_line": start_line,
+            "end_line": end_line,
+            "is_entry_point": 1 if qn in entry_meta else 0,
+            "entry_kind": entry_kind,
+            "reachable_from_unauth": unauth,
+            "is_sink": 1 if qn in sink_meta else 0,
+            "sink_line": sink_line,
+        })
+
+    return node_rows, sorted(edges)
+
+
+def save_callgraph(run_id: str, step: str, obj) -> str | None:
+    """Persist a normalized callgraph snapshot and bind the current step to it.
+
+    Unlike checkpoint blobs, this path stores rows rather than a single BLOB,
+    so large graphs remain resumable and queryable.
+    """
+    rows = _graph_rows(obj)
+    if rows is None:
+        return None
+    node_rows, edge_rows = rows
+    payload = json.dumps({
+        "nodes": node_rows,
+        "edges": edge_rows,
+    }, sort_keys=True, separators=(",", ":")).encode()
+    graph_id = hashlib.sha256(payload).hexdigest()[:32]
+
+    con = connect()
+    try:
+        with con:
+            con.execute("INSERT OR IGNORE INTO runs(run_id, repo_root) VALUES (?, '')",
+                        (run_id,))
+            con.execute("UPDATE runs SET updated_at = datetime('now') WHERE run_id = ?",
+                        (run_id,))
+            exists = con.execute(
+                "SELECT 1 FROM callgraph_snapshots WHERE run_id=? AND graph_id=?",
+                (run_id, graph_id),
+            ).fetchone()
+            if exists is None:
+                con.execute(
+                    "INSERT INTO callgraph_snapshots"
+                    "(run_id, graph_id, node_count, edge_count, entry_point_count, sink_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        graph_id,
+                        len(node_rows),
+                        len(edge_rows),
+                        sum(r["is_entry_point"] for r in node_rows),
+                        sum(r["is_sink"] for r in node_rows),
+                    ),
+                )
+                con.executemany(
+                    "INSERT INTO callgraph_nodes"
+                    "(run_id, graph_id, qnode, file_path, function_name, start_line, end_line, "
+                    " is_entry_point, entry_kind, reachable_from_unauth, is_sink, sink_line) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(
+                        run_id,
+                        graph_id,
+                        row["qnode"],
+                        row["file_path"],
+                        row["function_name"],
+                        row["start_line"],
+                        row["end_line"],
+                        row["is_entry_point"],
+                        row["entry_kind"],
+                        row["reachable_from_unauth"],
+                        row["is_sink"],
+                        row["sink_line"],
+                    ) for row in node_rows],
+                )
+                con.executemany(
+                    "INSERT INTO callgraph_edges"
+                    "(run_id, graph_id, caller_qnode, callee_qnode) VALUES (?, ?, ?, ?)",
+                    [(run_id, graph_id, caller, callee) for caller, callee in edge_rows],
+                )
+            con.execute(
+                "INSERT OR REPLACE INTO callgraph_stage_refs(run_id, step, graph_id) VALUES (?, ?, ?)",
+                (run_id, step, graph_id),
+            )
+        return graph_id
+    finally:
+        con.close()
+
+
+def load_callgraph(run_id: str, step: str) -> dict | None:
+    """Load a normalized callgraph snapshot bound to ``(run_id, step)``.
+
+    Returns ``None`` when the step has no bound graph.
+    """
+    con = connect()
+    try:
+        ref = con.execute(
+            "SELECT graph_id FROM callgraph_stage_refs WHERE run_id=? AND step=?",
+            (run_id, step),
+        ).fetchone()
+        if ref is None:
+            return None
+        graph_id = ref[0]
+        node_rows = con.execute(
+            "SELECT qnode, file_path, function_name, start_line, end_line, "
+            "is_entry_point, reachable_from_unauth, is_sink "
+            "FROM callgraph_nodes WHERE run_id=? AND graph_id=?",
+            (run_id, graph_id),
+        ).fetchall()
+        edge_rows = con.execute(
+            "SELECT caller_qnode, callee_qnode FROM callgraph_edges "
+            "WHERE run_id=? AND graph_id=?",
+            (run_id, graph_id),
+        ).fetchall()
+    finally:
+        con.close()
+
+    node_meta: dict[str, tuple[int, int, int]] = {}
+    call_graph_files: dict[str, list[str]] = defaultdict(list)
+    def_spans: dict[str, list[int]] = {}
+    for (qn, file_path, fn_name, start_line, end_line,
+         is_ep, unauth, is_sink) in node_rows:
+        node_meta[qn] = (int(is_ep or 0), int(unauth or 0), int(is_sink or 0))
+        if fn_name and file_path and start_line:
+            site = f"{file_path}:{int(start_line)}"
+            sites = call_graph_files[fn_name]
+            if site not in sites:
+                sites.append(site)
+        if start_line or end_line:
+            def_spans[qn] = [int(start_line or 0), int(end_line or 0)]
+
+    def _edge_score(caller: str, callee: str) -> tuple[int, int, int, str, str]:
+        c_ep, c_unauth, c_sink = node_meta.get(caller, (0, 0, 0))
+        t_ep, t_unauth, t_sink = node_meta.get(callee, (0, 0, 0))
+        return (
+            -max(c_unauth, t_unauth),
+            -max(c_ep, t_ep),
+            -max(c_sink, t_sink),
+            caller,
+            callee,
+        )
+
+    ordered_edges = sorted(
+        {(caller, callee) for caller, callee in edge_rows if caller and callee},
+        key=lambda e: _edge_score(e[0], e[1]),
+    )
+
+    call_graph: dict[str, list[str]] = defaultdict(list)
+    for caller, callee in ordered_edges:
+        call_graph[caller].append(callee)
+
+    # Preserve isolated nodes as keys to keep graph shape stable across
+    # save/load even when a function currently has no outgoing edge.
+    for qn in node_meta:
+        call_graph.setdefault(qn, [])
+
+    return {
+        "graph_id": graph_id,
+        "call_graph": dict(call_graph),
+        "call_graph_files": {k: v for k, v in call_graph_files.items()},
+        "def_spans": def_spans,
+        "node_count": len(node_rows),
+        "edge_count": len(ordered_edges),
+    }
+
+
 def reset_run(run_id: str) -> int:
     """Delete every checkpoint row for one run — the fixed s1..s9 steps AND the
     dynamic ``remediate_<idx>`` / ``validate_<id>`` steps.
@@ -147,9 +520,12 @@ def reset_run(run_id: str) -> int:
     con = connect()
     try:
         with con:
-            cur = con.execute(
-                "DELETE FROM checkpoints WHERE run_id = ?", (run_id,))
-            return cur.rowcount if cur.rowcount is not None else 0
+            cleared = 0
+            cur = con.execute("DELETE FROM checkpoints WHERE run_id = ?", (run_id,))
+            cleared += cur.rowcount or 0
+            cur = con.execute("DELETE FROM callgraph_snapshots WHERE run_id = ?", (run_id,))
+            cleared += cur.rowcount or 0
+            return cleared
     finally:
         con.close()
 

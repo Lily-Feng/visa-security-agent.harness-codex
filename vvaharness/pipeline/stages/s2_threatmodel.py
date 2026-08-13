@@ -32,13 +32,16 @@ Output ThreatModel is attached to ContextPackage and rendered into:
 """
 from __future__ import annotations
 import fnmatch
+import logging
+import re
 import sys
 from collections import Counter
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 from vvaharness.models import ThreatModel, CVE, Control, AppProfile, ContextPackage
 from vvaharness.backends.llm import prompt
-import re
 
 from vvaharness.util.json_extract import extract_json
 from vvaharness.lang.hints import EXT_TO_LANG, LANG_DISPLAY
@@ -219,9 +222,36 @@ def _gather_evidence(repo_root: str, cfg,
     s2 = getattr(cfg, "step2", None)
     doc_cap = getattr(s2, "max_doc_chars", 20000)
     manifest_cap = getattr(s2, "max_manifest_chars", 4000)
-    cap = lambda k, d: getattr(s2, k, d)
 
-    all_files = list(ctx.all_files) if ctx else []
+    def _cap_int(key: str, default: int) -> int:
+        return int(getattr(s2, key, default) or default)
+
+    max_graph_files = _cap_int("max_graph_files", 220)
+    max_entry_points = _cap_int("max_entry_points", 80)
+    max_graph_sinks = _cap_int("max_graph_sinks", 80)
+    max_modules = _cap_int("max_modules", 40)
+    max_graph_edges = _cap_int("max_graph_edges", 100)
+    max_notes_chars = _cap_int("max_notes_chars", 2500)
+    max_function_sites = _cap_int("max_function_sites", 80)
+    max_config_reps = _cap_int("max_config_reps", 60)
+    max_api_artefacts = _cap_int("max_api_artefacts", 80)
+    # Prompt caps use their OWN keys, distinct from the frontier caps
+    # (max_modules / max_entry_points) read above.
+    max_modules_prompt = _cap_int("max_prompt_modules", 100)
+    max_entry_points_prompt = _cap_int("max_prompt_entry_points", 400)
+
+    frontier = None
+    if ctx:
+        frontier = ctx.ast_context_view(
+            max_files=max_graph_files,
+            max_entry_points=max_entry_points,
+            max_sinks=max_graph_sinks,
+            max_modules=max_modules,
+            max_edges=max_graph_edges,
+            max_notes_chars=max_notes_chars,
+        )
+    active_ctx = frontier or ctx
+    all_files = list(active_ctx.all_files) if active_ctx else []
 
     lang_counts: Counter[str] = Counter()
     for rel in all_files:
@@ -273,10 +303,23 @@ def _gather_evidence(repo_root: str, cfg,
     top_dirs = sorted({rel.split("/", 1)[0] for rel in all_files if "/" in rel})
 
     # s1-mapped modules (asset candidates) and entry points (trust boundaries).
-    modules = [(m.name, m.purpose, m.loc) for m in (ctx.modules if ctx else [])]
+    modules = [(m.name, m.purpose, m.loc) for m in (active_ctx.modules if active_ctx else [])]
     eps = [(e.kind, e.reachable_from_unauth, e.file, e.function)
-           for e in (ctx.entry_points if ctx else [])]
+           for e in (active_ctx.entry_points if active_ctx else [])]
     eps.sort(key=lambda t: (t[0] != "network", not t[1], t[0], t[2]))
+
+    function_sites: list[tuple[str, list[str], str]] = []
+    if active_ctx:
+        for fn, sites in list(active_ctx.call_graph_files.items())[:max_function_sites]:
+            span = active_ctx.def_spans.get(fn)
+            span_txt = f" lines {span[0]}-{span[1]}" if span and len(span) == 2 else ""
+            function_sites.append((fn, sites[:2], span_txt))
+
+    call_edges: list[tuple[str, str]] = []
+    if active_ctx:
+        for caller, callees in active_ctx.call_graph.items():
+            for callee in list(dict.fromkeys(callees or [])):
+                call_edges.append((caller, callee))
 
     # Representative config files (post-dedup) — one per top-level dir is
     # enough to surface every external integration / data store.
@@ -290,7 +333,7 @@ def _gather_evidence(repo_root: str, cfg,
             if top not in seen:
                 seen.add(top)
                 cfg_reps.append(rel)
-    cfg_reps = cfg_reps[:cap("max_config_reps", 60)]
+    cfg_reps = cfg_reps[:max_config_reps]
 
     # API-contract artefacts (proto/openapi/graphql/…) — explicit boundaries.
     api_artefacts: list[str] = []
@@ -299,17 +342,20 @@ def _gather_evidence(repo_root: str, cfg,
             if fnmatch.fnmatchcase(rel, g) or fnmatch.fnmatchcase(rel.lower(), g):
                 api_artefacts.append(rel)
                 break
-    api_artefacts = api_artefacts[:cap("max_api_artefacts", 80)]
+    api_artefacts = api_artefacts[:max_api_artefacts]
 
     return {
         "file_count": len(all_files),
+        "original_file_count": len(ctx.all_files) if ctx else len(all_files),
         "primary_language": ctx.language if ctx else "",
         "languages": lang_counts.most_common(),
         "top_dirs": top_dirs,
-        "modules": modules[:cap("max_modules", 80)],
-        "modules_truncated": len(modules) > cap("max_modules", 80),
-        "entry_points": eps[:cap("max_entry_points", 120)],
-        "entry_points_truncated": len(eps) > cap("max_entry_points", 120),
+        "modules": modules[:max_modules_prompt],
+        "modules_truncated": len(modules) > max_modules_prompt,
+        "entry_points": eps[:max_entry_points_prompt],
+        "entry_points_truncated": len(eps) > max_entry_points_prompt,
+        "function_sites": function_sites,
+        "call_edges": call_edges,
         "config_reps": cfg_reps,
         "api_artefacts": api_artefacts,
         "docs": docs,
@@ -402,6 +448,15 @@ def _build_user_prompt(repo_root: str, repo_name: str, ev: dict,
     if ev["entry_points_truncated"]:
         ep_block += "\n  …(truncated)"
 
+    site_block = "\n".join(
+        f"  - {fn} @ {', '.join(sites)}{span_txt}"
+        for fn, sites, span_txt in ev["function_sites"]
+    ) or "  (none)"
+
+    edge_block = "\n".join(
+        f"  - {caller} -> {callee}" for caller, callee in ev["call_edges"]
+    ) or "  (none)"
+
     cfg_block = "\n".join(f"  - {p}" for p in ev["config_reps"]) \
                 or "  (none)"
     api_block = "\n".join(f"  - {p}" for p in ev["api_artefacts"]) \
@@ -437,7 +492,7 @@ def _build_user_prompt(repo_root: str, repo_name: str, ev: dict,
 
     return f"""TARGET: {repo_name}  ({repo_root})
 PRIMARY LANGUAGE: {ev['primary_language'] or 'unknown'}
-FILES IN SCOPE: {ev['file_count']}
+FILES IN AST FRONTIER: {ev['file_count']} (from {ev['original_file_count']} total in-scope files)
 
 {cmdb_block}LANGUAGE BREAKDOWN:
 {lang_block}
@@ -450,6 +505,12 @@ MODULES (s1-mapped — treat as asset candidates):
 
 ENTRY POINTS (s1-mapped — these ARE the trust boundaries; STRIDE hint per kind):
 {ep_block}
+
+AST FUNCTION SITES (method-level anchors chosen from entry-point/sink/callgraph frontier):
+{site_block}
+
+AST CALL EDGES (bounded frontier, one edge per line):
+{edge_block}
 
 REPRESENTATIVE CONFIGURATION (one per component, post-dedup — reveals data
 stores, message buses, key/secret managers, TLS posture, external endpoints):
@@ -485,13 +546,33 @@ def run(repo_root: str, repo_name: str, cfg,
         ctx: ContextPackage | None = None,
         app_profile: AppProfile | None = None) -> ThreatModel:
     s2 = getattr(cfg, "step2", None)
+    tracker = getattr(cfg, "_scan_progress", None)
+    log.info("s2/threatmodel: starting threat modeling for %s", repo_name)
+    if ctx is not None:
+        print(
+            "  [s2] ctx: "
+            f"type={type(ctx).__module__}.{type(ctx).__name__}, "
+            f"has_ast_context_view={hasattr(ctx, 'ast_context_view')}, "
+            f"all_files={len(getattr(ctx, 'all_files', []) or [])}",
+            file=sys.stderr,
+        )
+        log.debug("s2/threatmodel: context has_ast_view=%s files=%d",
+                  hasattr(ctx, 'ast_context_view'), len(getattr(ctx, 'all_files', []) or []))
     ev = _gather_evidence(repo_root, cfg, ctx)
+    if tracker is not None:
+        tracker.stage_note(
+            "s2",
+            (f"evidence files={ev['file_count']} modules={len(ev['modules'])} "
+             f"eps={len(ev['entry_points'])} api={len(ev['api_artefacts'])}"),
+        )
     print(f"  [s2] evidence: {ev['file_count']} files, "
           f"{len(ev['modules'])} modules, {len(ev['entry_points'])} entry points, "
           f"{len(ev['config_reps'])} config reps, "
           f"{len(ev['api_artefacts'])} api artefacts, "
           f"{len(ev['docs'])} docs, {len(ev['manifests'])} manifests",
           file=sys.stderr)
+    print(f"  [s2] frontier: {ev['file_count']} / {ev['original_file_count']} files "
+          f"(AST-focused evidence view)", file=sys.stderr)
 
     baseline_mode = getattr(s2, "baseline", "auto")
     kinds, baseline = _baseline_block(ev, ctx, baseline_mode)
@@ -501,6 +582,8 @@ def run(repo_root: str, repo_name: str, cfg,
     user = _build_user_prompt(repo_root, repo_name, ev, known_cves, controls,
                               app_profile=app_profile,
                               baseline_block=baseline)
+    if tracker is not None:
+        tracker.stage_note("s2", "threat-model LLM request started")
 
     raw = prompt(
         user,
@@ -509,6 +592,8 @@ def run(repo_root: str, repo_name: str, cfg,
         max_tokens=getattr(s2, "max_tokens", 16000),
         tag="s2 threatmodel",
     )
+    if tracker is not None:
+        tracker.stage_note("s2", "threat-model LLM response received")
 
     data = extract_json(raw)
     tm = ThreatModel.model_validate(data)
@@ -520,4 +605,6 @@ def run(repo_root: str, repo_name: str, cfg,
     print(f"  [s2] done: {len(tm.assets)} assets, "
           f"{len(tm.trust_boundaries)} trust boundaries, "
           f"{len(tm.threats)} threats", file=sys.stderr)
+    log.info("s2/threatmodel: threat model complete - assets=%d boundaries=%d threats=%d",
+             len(tm.assets), len(tm.trust_boundaries), len(tm.threats))
     return tm

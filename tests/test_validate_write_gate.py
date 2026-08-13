@@ -16,14 +16,15 @@
 
 from pathlib import Path
 
-from vvaharness.validation.backends.contract.permissions import PermissionsPolicy
+from vvaharness.backends.harness.contract.permissions import PermissionsPolicy
+from vvaharness.validation.constants.policy import DEFAULT_ALLOWED_OUTPUT_FILES
 from vvaharness.validation.constants.artifacts import VALIDATION_REPORT_FILENAME
 
 
 def _decide(target_dir: Path, file_path: str) -> bool:
-    decision = PermissionsPolicy(target_dir=target_dir).evaluate(
-        "Write", {"file_path": file_path}
-    )
+    decision = PermissionsPolicy(
+        target_dir=target_dir, allowed_output_files=DEFAULT_ALLOWED_OUTPUT_FILES
+    ).evaluate("Write", {"file_path": file_path})
     return decision.allow
 
 

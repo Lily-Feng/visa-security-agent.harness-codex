@@ -21,6 +21,7 @@ response→verdict coercion. None of these touch the monkeypatched model seam.""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from vvaharness.util.json_extract import extract_json
 from vvaharness.remediation_agent.models import RemediationVerdict
@@ -51,13 +52,18 @@ def _build_user(finding: Finding, repo: Path, mode: str, *, pre=None, ctx=None) 
     return build_user(finding, str(repo), mode=mode)
 
 
-def _coerce_verdict(raw: str, finding: Finding) -> RemediationVerdict:
+def _coerce_verdict(raw: Any, finding: Finding) -> RemediationVerdict:
     """Validate the agent's response into a :class:`RemediationVerdict`.
 
     Delegates to :meth:`RemediationVerdict.coerce`, which salvages a
     near-complete response (e.g. one missing the ``summary`` field) instead of
     discarding the whole thing. Only a totally unparseable response degrades to
     a bare ``Needs Review``."""
+    if isinstance(raw, RemediationVerdict):
+        raw.finding_index = finding.index
+        return raw
+    if isinstance(raw, dict):
+        return RemediationVerdict.coerce(raw, finding_index=finding.index)
     try:
         data = extract_json(raw)
     except Exception as e:  # noqa: BLE001 — no JSON at all in the response

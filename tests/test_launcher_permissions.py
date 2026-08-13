@@ -22,8 +22,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vvaharness.validation.backends.claude.options import build_streaming_sdk_options
-from vvaharness.validation.backends.contract.permissions import PermissionsPolicy
+from vvaharness.backends.harness.claude.options import build_streaming_sdk_options
+from vvaharness.backends.harness.contract.permissions import PermissionsPolicy
 from vvaharness.validation.config import load_config
 from vvaharness.validation.models import Manifest
 from vvaharness.validation.session.launcher import build_validation_options

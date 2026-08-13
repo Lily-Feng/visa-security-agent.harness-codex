@@ -42,16 +42,22 @@ If the tool genuinely misbehaves after `setup` is green, report it as a bug
 ---
 
 ## What this tool does
-A 9-stage LLM SAST pipeline: survey → threat-model → decompose → deep-dive →
-pre-filter → adversarial-verify → dedup → chain → SARIF. It emits a Markdown
-report + SARIF 2.1.0.
+An S0–S9 detection pipeline plus remediation/validation. S0 is a configurable
+static seed stage (`step0`) enabled by the shipped `default` and `taint`
+profiles. Their rules-mode configuration needs operator-supplied generated
+source/sink YAML to produce a seed; no such rule pack is bundled. Without it,
+S0 returns an empty seed and S1 and the later stages continue. The core
+detection flow is survey → threat-model →
+decompose → deep-dive → pre-filter → adversarial-verify → dedup → chain →
+SARIF. It emits a Markdown report + SARIF 2.1.0.
 
 > ⚠️ **The default profile does more than scan — it also remediates and
 > validates.** With the shipped `default.yaml` (`step_remediate.enabled: true`
 > and `step_validate.enabled: true`), `vvaharness scan` continues past s9 into
-> **Step 10 — Remediate** and **Step 11 — Validate** (an 11-step run). Step 10
-> runs the Remediation Agent in **fix mode: it edits source files in the target
-> repo** and writes `<repo>/security-remediation/`. Step 11 then runs the
+> **Step 10 — Remediate** and **Step 11 — Validate** (S0 plus S1–S11). When
+> findings, credentials, and a successful fix session are available, Step 10 runs the Remediation Agent in
+> **fix mode: it edits source files in the target repo** and writes
+> `<repo>/security-remediation/`. Step 11 then runs the
 > agentic validation panel over those fixes. If you only want detection (no
 > changes to the target), pass `--stop-after s9`, or use a profile with
 > `step_remediate.enabled: false` / `step_validate.enabled: false`.
@@ -67,18 +73,34 @@ which first discovers the DTOs awaiting validation, then runs the panel). See `d
 pipx install .            # or: pip install .   (one command on PATH: vvaharness)
 vvaharness setup         # checks Python, agents, keys, gateway, config
 ```
-`setup` tells you exactly what (if anything) is missing and how to fix it. Do
-what it says, then re-run `setup` until it prints **Ready ✓**.
+`setup` reports the normal readiness checks and remedies. Do what it says, then
+re-run it until green, while also applying the SDK-profile S11 caveat below:
+the current probe does not exercise that Agent-SDK launcher.
 
-## Choosing a profile (don't guess — `setup` recommends one)
+## Choosing a profile (`setup` recommends a starting point)
 | You have… | Use | How |
 |---|---|---|
-| Claude Code auth (`claude login` / gateway token) | `default` | default — no flag |
-| `ANTHROPIC_SDK_API_KEY` (sk-ant-…) | `sdk` | `--config vvaharness/config/profiles/sdk.yaml` |
-| Multi-provider (Anthropic SDK + `OPENAI_API_KEY`) | `full` | `--config vvaharness/config/profiles/full.yaml` |
+| Claude Code auth + an Anthropic provider key | `default` | default — no flag |
+| Anthropic SDK/API credential(s) | `sdk` | `--config vvaharness/config/profiles/sdk.yaml` |
+| Multi-provider (Claude auth + Anthropic SDK + OpenAI) | `full` | `--config vvaharness/config/profiles/full.yaml` |
+| Claude Code auth, detection only; external rules for an S0 seed | `taint` | `--config vvaharness/config/profiles/taint.yaml` |
+
+The recommendation is a starting point, not proof that every enabled post-scan
+stage is ready. Re-run `setup` with the chosen profile and resolve its warnings.
 
 No shipped profile enables `Bash`. To let a `via: cli` role shell out, add
 `- Bash` to its `allowed_tools` in your own copy (trusted targets only).
+
+`sdk.yaml` has a post-scan credential split that `setup`/`doctor` can currently
+false-green: `ANTHROPIC_SDK_API_KEY` authenticates S1–S10, but its S11 Claude
+Agent SDK launcher does not translate that SDK-named key. S11 pins external
+`claude` and can reuse an ambient Claude login / `CLAUDE_CODE_OAUTH_TOKEN`, or
+use `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`. A standard Anthropic
+credential alone can cover all stages because sole-SDK detection accepts it as
+a fallback; otherwise pair the SDK-named key with working Claude auth for S11.
+For `full.yaml`, the Claude auth already required by its CLI roles can also
+serve S11, so standard Anthropic auth is an alternative, not a fourth mandatory
+credential.
 
 ### Internal gateway note (common cause of 401)
 If `ANTHROPIC_API_KEY` is a JWT (`eyJ…`) you are using a gateway/Claude-Code
@@ -88,7 +110,7 @@ export ANTHROPIC_BASE_URL=https://<your-gateway>/
 export NODE_EXTRA_CA_CERTS=$HOME/cacerts.pem   # if it needs a private CA
 export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 # if the gateway returns "400 invalid beta flag"
 ```
-`vvaharness setup` auto-detects this and prints the exact lines **when the active profile uses a `via: sdk` role** (e.g. `sdk`/`full`). The shipped default profile is all `via: cli`, so `setup` will not auto-print these — set them yourself if your gateway token needs them. Set them in
+`vvaharness setup` auto-detects this and prints the exact lines **when the active profile uses a `via: sdk` role** (e.g. `sdk`/`full`). The shipped default profile has no `via: sdk` roles (`via: cli` for S1-S9 and `via: deepagents` for S10-S11), so `setup` will not auto-print these — set them yourself if your gateway token needs them. Set them in
 your shell or `.env` — **do not** edit the package to work around it.
 
 ## Running a scan
@@ -96,12 +118,14 @@ your shell or `.env` — **do not** edit the package to work around it.
 vvaharness estimate --repo /path/to/target          # scope/cost preview, no spend
 vvaharness scan --repo /path/to/target --application-id <id> [--config <profile>]
 ```
-- Progress prints per stage (`▶ … / ✓ … (Ns)`). With the default profile the
-  counter runs to **11** (s1–s9 scan, then s10 remediate, s11 validate).
-- Output: `<target>/security-scan/*_report.md`, `*.sarif`, `*_errors.jsonl`.
-- With the default profile, a scan **also** writes `<target>/security-remediation/`
-  and **edits source files in the target repo** (s10 fix-mode remediation), then
-  validates those fixes (s11). Use `--stop-after s9` for detection only.
+- Progress prints per stage (`▶ … / ✓ … (Ns)`). The default runs S0, S1–S9,
+  then enabled S10 remediation and S11 validation.
+- Output: `<target>/security-scan/*_report.md` and `*.sarif`; an
+  `*_errors.jsonl` file is created only when a recoverable error is logged.
+- With the default profile, a successful S10 fix session with findings and
+  credentials writes `<target>/security-remediation/` and can **edit source
+  files in the target repo**, then S11 validates those fixes. Use
+  `--stop-after s9` for detection only.
 - A `run_manifest.json` (written in the current working directory, not under `security-scan/`) records models/config/timing for the run.
 - Findings are **triage candidates, not confirmed vulnerabilities** — say so
   when you summarize them.
@@ -121,17 +145,18 @@ vvaharness scan --repo /path/to/target --application-id <id> [--config <profile>
 - **Validation runs in-scan by default, and is also a standalone command.**
   With the default profile it executes as Step 11 of `scan` (see the warning
   under *What this tool does*); run on its own, `vvaharness validate --repo <path>`
-  discovers remediation DTOs written by the `remediate` command (s10, no model
-  spend) and runs an agentic adversarial panel (s11) to fill each DTO's
-  `validation` block. It uses the bundled Claude Agent SDK (Python ≥3.10) and an
-  Anthropic model (`models.validate` must
-  be `via: cli` or `via: sdk`; a `via: openai` validate model is refused when the
-  validate step starts, before any model spend — the standalone `validate`
-  command exits non-zero, and inside a `scan` Step 11 is skipped with a warning
-  while the rest of the scan still completes). The panel
-  runs in the Claude Agent SDK's permission sandbox: it reads the repo and writes
-  only its own validation artifacts — there is no Docker, and nothing is applied
-  to the scanned repo. Re-runs are idempotent (already-`validated` DTOs are skipped;
+  discovers remediation DTOs written by the model-backed `remediate` command
+  (S10). That S11 discovery phase has no model spend; S11 then runs an agentic
+  adversarial panel to fill each DTO's
+  `validation` block. The default runtime is the DeepAgents backend
+  (`via: deepagents`, as shipped in `default.yaml`); `cli` and `sdk` backends run
+  the bundled Claude Agent SDK instead. Permitted backends: `via: cli`, `via: sdk`,
+  `via: deepagents`; a legacy `via: openai` validate model is routed to
+  `via: deepagents` with the OpenAI provider, so the same profile spelling that
+  detection and report-only remediation accept also works here. The panel reads
+  the repo and writes only its
+  own validation artifacts — there is no Docker, and nothing is applied to the
+  scanned repo. Re-runs are idempotent (already-`validated` DTOs are skipped;
   `validation_failed` / `needs_review` stay re-validatable).
 
 ## Do / Don't (quick reference)

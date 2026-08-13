@@ -204,23 +204,47 @@ def _augment_sarif(path: Path, pairs: list[Pair]) -> None:
 
 _MD_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+# Inline Markdown / HTML metacharacters that could forge emphasis/links/code spans,
+# inject HTML (active content in a permissive renderer), or break out of a table cell.
+# Applied as a single per-character pass, so a backslash already present in the
+# untrusted text is itself escaped and cannot consume the escape added for the
+# character that follows it. Mirrors the audited map in
+# remediation_agent/report_augment/mdsafe.py.
+_MD_ESCAPE: dict[str, str] = {
+    "\\": "\\\\", "`": "\\`", "*": "\\*", "_": "\\_",
+    "[": "\\[", "]": "\\]", "|": "\\|", "#": "\\#",
+    "<": "&lt;", ">": "&gt;", "&": "&amp;",
+}
+
+
+def _trim_dangling_escape(text: str) -> str:
+    """Drop a trailing lone backslash left behind by truncation.
+
+    Escaping doubles every backslash, so a complete sequence always ends in an even-length
+    run. An odd run means the length limit cut one in half, and the surviving backslash
+    would escape whatever follows it -- e.g. the ``|`` delimiter opening the next cell.
+    """
+    if (len(text) - len(text.rstrip("\\"))) % 2:
+        return text[:-1]
+    return text
+
 
 def _md_escape(text: object, limit: int = 2000) -> str:
     """Neutralize agent-authored text for inline Markdown.
 
-    Strips control chars, defangs HTML and link/code syntax, collapses newlines, and
-    bounds length so the text renders inertly.
+    Strips control chars, defangs HTML and link/code/table syntax, collapses newlines, and
+    bounds length so the text renders inertly. Truncation happens after escaping so the
+    returned length is the real bound callers rely on.
     """
     s = _MD_CTRL_RE.sub("", str(text))
     s = s.replace("\r", " ").replace("\n", " ")
-    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    s = s.replace("[", "\\[").replace("`", "\\`")
-    return s[:limit]
+    s = "".join(_MD_ESCAPE.get(ch, ch) for ch in s)
+    return _trim_dangling_escape(s[:limit])
 
 
 def _md_cell(text: object) -> str:
-    """Escape a value for a Markdown table cell (adds the ``|`` delimiter to _md_escape)."""
-    return _md_escape(text, limit=200).replace("|", "\\|")
+    """Escape a value for a Markdown table cell (``|`` is part of the escape map)."""
+    return _md_escape(text, limit=200)
 
 
 def _gate_rows(gates: dict) -> list[str]:

@@ -65,12 +65,14 @@ def _md_cell(text) -> str:
 
     Operator-supplied app_id / repo_name (and exception text) flow into the
     summary; a raw ``|`` forges/shifts cells, a newline forges rows or
-    terminates a table/heading to append attacker-chosen Markdown. Mirrors the
-    audited escaper in vvaharness/models.py and validation/report/augment.py."""
+    terminates a table/heading to append attacker-chosen Markdown. A backslash is
+    escaped before ``|`` so a supplied backslash cannot consume the escape added
+    for the delimiter. Mirrors the audited escaper in
+    vvaharness/remediation_agent/report_augment/mdsafe.py."""
     if text is None:
         return ""
     return (str(text).replace("\r", " ").replace("\n", " ")
-            .replace("|", "\\|").strip())
+            .replace("\\", "\\\\").replace("|", "\\|").strip())
 
 
 def _stash_url_for(repo_name: str, base: str) -> str:

@@ -27,4 +27,7 @@ Critical rules (full details in AGENTS.md):
 3. On any failure run `vvaharness setup` / `vvaharness doctor`, fix the
    environment it points to, and re-run. Report bugs; don't patch around them.
 
-Quick start: `pipx install .` → `vvaharness setup` → `vvaharness scan --repo <path>`.
+Detection-only quick start: `pipx install .` → `vvaharness setup` →
+`vvaharness scan --repo <path> --stop-after s9`.
+
+A plain `scan` may edit target source through default S10 fix-mode remediation.

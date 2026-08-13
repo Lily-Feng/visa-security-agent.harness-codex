@@ -16,24 +16,31 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
 import shutil
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
-from vvaharness.validation.backends import (
-    VALIDATION_POLICY,
+from vvaharness.backends.harness import (
     Harness,
     HarnessCLINotFoundError,
     HarnessError,
-    PermissionsPolicy,
+    HarnessMessage,
+    HarnessResult,
     StreamingOptions,
     get_harness,
 )
+from vvaharness.report.redact import redact_tree
 from vvaharness.validation.config import Config
 from vvaharness.validation.constants.artifacts import (
     ANTHROPIC_API_KEY,
     ANTHROPIC_AUTH_TOKEN,
+    CLAUDE_CONFIG_BACKENDS,
+    HOST_GATE_SYNTHESIS_BACKENDS,
     LOGGING_DIRNAME,
     MANIFEST_FILENAME,
     ORCHESTRATOR_LOG_DIRNAME,
@@ -47,19 +54,46 @@ from vvaharness.validation.constants.artifacts import (
     SESSION_ENV_PROJECT_DIR,
     SESSION_ENV_SESSION_ID,
     SESSION_ENV_TARGET_DIR,
+    SYNTHESIZED_GATES_FILENAME,
+    VALIDATION_REPORT_FILENAME,
 )
 from vvaharness.validation.constants.paths import (
     VALIDATION_PATHS,
     resolve_path,
 )
 from vvaharness.validation.io.message_logger import stream_and_log
+from vvaharness.validation.io.persona_report_stash import extract_subagent_reports
 from vvaharness.validation.models import Manifest
 from vvaharness.validation.session.config_inject import inject_claude_config
 from vvaharness.validation.session.errors import ValidationSessionError
 from vvaharness.validation.session.launch_prompt import build_launch_prompt
+from vvaharness.validation.session.rules import (
+    orchestrator_rules_text,
+    persona_rules_text,
+)
+from vvaharness.validation.session.setup import (
+    DEFAULT_FACT_TOOLS,
+    VALIDATION_GRAPH_NAME,
+    VALIDATION_POLICY,
+    ValidationOutput,
+    build_validation_tools,
+    validation_skill_root,
+    validation_write_gate,
+)
 from vvaharness.validation.subagents import load_agents
+from vvaharness.validation.synthesis._consensus import synthesize_gates_for_finding
 
 log = logging.getLogger(__name__)
+
+# Environment variables propagated into validation sessions when the profile
+# does not override them. Covers Anthropic and OpenAI-compatible endpoints.
+_DEFAULT_VALIDATE_ENV_VARS: tuple[str, ...] = (
+    ANTHROPIC_API_KEY,
+    ANTHROPIC_AUTH_TOKEN,
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+)
 
 
 def _build_env(
@@ -84,6 +118,10 @@ def _build_env(
         SESSION_ENV_SESSION_ID: manifest.session_id,
         SESSION_ENV_PROJECT_DIR: str(workspace),
     }
+    for name in _DEFAULT_VALIDATE_ENV_VARS:
+        value = os.environ.get(name)
+        if value is not None:
+            env[name] = value
     if config.ghe.token:
         env[SESSION_ENV_GH_TOKEN] = config.ghe.token
     if config.ghe.archived_token:
@@ -96,22 +134,22 @@ def _persona_overrides(config: Config) -> dict[str, str]:
     return {
         name: model
         for name, model in (
-            ("security-architect", config.claude.security_architect_model),
-            ("penetration-tester", config.claude.penetration_tester_model),
-            ("cross-repo-analyzer", config.claude.cross_repo_analyzer_model),
+            ("security-architect", config.agent.security_architect_model),
+            ("penetration-tester", config.agent.penetration_tester_model),
+            ("cross-repo-analyzer", config.agent.cross_repo_analyzer_model),
         )
         if model
     }
 
 
 def _resolve_binary(binary: str) -> str:
-    """Resolve ``config.claude.binary`` (from $VVAHARNESS_CLAUDE_BINARY, default
-    ``"claude"``) to an absolute path so the SDK runs a PINNED executable rather
-    than resolving a bare name against PATH at launch (CWE-426/427).
+    """Resolve the configured agent binary to an absolute, pinned path.
 
-    An explicit path that exists is used as-is; a bare name is resolved via PATH
-    and pinned. On miss, the input is returned unchanged (the SDK then resolves
-    it as before) so this never breaks a working setup."""
+    Pinning matters because the SDK would otherwise resolve a bare name against
+    PATH at launch time (CWE-426/427). An explicit path that exists is used
+    as-is; a bare name is resolved via PATH. On miss the input is returned
+    unchanged so this never breaks an otherwise working setup.
+    """
     if Path(binary).is_file():
         return str(binary)
     found = shutil.which(binary)
@@ -119,6 +157,74 @@ def _resolve_binary(binary: str) -> str:
         return found
     log.warning("claude binary %r not found on PATH; SDK will resolve it", binary)
     return binary
+
+
+def _write_workspace_json(workspace: Path, filename: str, payload: Any) -> None:
+    """Write *payload* to *workspace/filename* atomically, redacting first.
+
+    Warnings are logged on failure; callers rely on downstream scoring to fail
+    closed when the file is absent.
+    """
+    dest = workspace / filename
+    tmp = dest.with_suffix(f"{dest.suffix}.tmp")
+    try:
+        text = json.dumps(redact_tree(payload), indent=2) + "\n"
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(dest)
+    except (OSError, TypeError, ValueError):
+        log.exception("cannot write %s", dest)
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+
+
+def _write_validation_outputs(workspace: Path, structured: Any) -> None:
+    """Persist structured validation output to the workspace JSON artifacts."""
+    if not isinstance(structured, dict):
+        log.warning("structured validation output is not a dict; skipping host write")
+        return
+    findings = structured.get("findings")
+    gates = structured.get("synthesized_gates")
+    target_status = structured.get("target_jira_status")
+    if findings is not None:
+        _write_workspace_json(
+            workspace,
+            VALIDATION_REPORT_FILENAME,
+            {"target_jira_status": target_status, "findings": findings},
+        )
+    if gates is not None:
+        _write_workspace_json(workspace, SYNTHESIZED_GATES_FILENAME, gates)
+
+
+def _write_host_synthesized_gates(
+    workspace: Path,
+    terminal_state: object,
+    tracking_ids: list[str],
+) -> None:
+    """Synthesize persona reports host-side and write synthesized_gates.json.
+
+    The deterministic synthesis path for backends whose subagents return
+    schema-validated reports. On failure nothing is written or deleted, so whatever
+    the orchestrator's own structured response left in the file stands.
+    """
+    if not isinstance(terminal_state, dict):
+        log.warning("terminal harness state is not a dict; skipping host synthesis")
+        return
+    reports = extract_subagent_reports(terminal_state)
+    if not reports:
+        log.warning("no valid persona reports extracted; skipping host synthesis")
+        return
+
+    synthesized: list[dict] = []
+    for tracking_id in tracking_ids:
+        gates = synthesize_gates_for_finding(reports, tracking_id)
+        if gates:
+            synthesized.append({
+                "tracking_id": tracking_id,
+                "gates": [gate.model_dump() for gate in gates],
+            })
+
+    if synthesized:
+        _write_workspace_json(workspace, SYNTHESIZED_GATES_FILENAME, synthesized)
 
 
 def build_validation_options(
@@ -134,23 +240,90 @@ def build_validation_options(
     except KeyError:
         log.exception("Unregistered validation_path for %s", manifest.jira_key)
         raise
+    injects_claude = _injects_claude_config(config)
     return StreamingOptions(
-        model=config.claude.model,
+        model=config.agent.model,
+        model_provider=config.agent.provider,
         cwd=workspace,
         env=_build_env(config, manifest, workspace, output_dir),
-        effort=config.claude.effort,
-        max_turns=config.claude.max_turns,
-        max_budget_usd=config.claude.max_budget_usd,
+        effort=config.agent.effort,
+        max_turns=config.agent.max_turns,
+        max_budget_usd=config.agent.max_budget_usd,
         system_prompt=system_prompt,
         setting_sources=("project",),
-        cli_path=_resolve_binary(config.claude.binary),
+        cli_path=_resolve_binary(config.agent.binary),
         tool_policy=VALIDATION_POLICY,
-        permissions=PermissionsPolicy(target_dir=workspace),
+        permissions=validation_write_gate(workspace),
+        response_model=ValidationOutput,
+        tool_builder=build_validation_tools,
+        fact_tools=DEFAULT_FACT_TOOLS,
+        skill_root=validation_skill_root(workspace) if injects_claude else None,
+        graph_name=VALIDATION_GRAPH_NAME,
         agents=load_agents(
             path_cfg.agent_names,
             model_overrides=_persona_overrides(config),
-            tools_override=config.claude.validate_tools,
+            tools_override=config.agent.validate_tools,
+            prompt_suffix=None if injects_claude else persona_rules_text(),
         ),
+    )
+
+
+def _injects_claude_config(config: Config) -> bool:
+    """Whether this backend receives the injected ``.claude/`` directory."""
+    return config.agent.via in CLAUDE_CONFIG_BACKENDS
+
+
+def _rules_section(config: Config) -> str:
+    """Build the prompt's Rules section for this backend.
+
+    Backends given ``.claude/`` auto-load the rules; the rest cannot see that
+    directory, so the same files are inlined here instead.
+    """
+    if _injects_claude_config(config):
+        return (
+            "## Rules\n\n"
+            "Follow the rules auto-loaded from `.claude/rules/`. They define persona\n"
+            "isolation, anti-manipulation safeguards, evidence requirements, gate\n"
+            "definitions, weights, and decision thresholds."
+        )
+    return (
+        "## Rules\n\n"
+        "These are the validation rules referred to above. Follow them as written.\n\n"
+        f"{orchestrator_rules_text()}"
+    )
+
+
+def _synthesizes_gates_on_host(config: Config) -> bool:
+    """Whether the host synthesizes gates from this backend's subagent reports."""
+    return config.agent.via in HOST_GATE_SYNTHESIS_BACKENDS
+
+
+def _synthesis_section(config: Config) -> str:
+    """Build the prompt's gate-synthesis section for this backend.
+
+    Where subagents return schema-validated reports the host synthesizes gates from
+    them, so the orchestrator must stay out of it. Everywhere else the orchestrator
+    is the only validated channel, so it reports the consensus itself and the host
+    writes exactly what it returns. Scoring stays on the host either way.
+    """
+    if _synthesizes_gates_on_host(config):
+        return (
+            "## Synthesis boundary\n\n"
+            "Do NOT synthesize across personas, compute scores, or fill "
+            "`synthesized_gates` —\nthe host performs deterministic synthesis and "
+            "scoring from the structured persona\nreports after you finish. Always "
+            "emit `synthesized_gates` as an empty list `[]`."
+        )
+    return (
+        "## Synthesis boundary\n\n"
+        "Fill `synthesized_gates` with one entry per finding, each carrying all four\n"
+        "gates, applying the synthesis rules from the validation rules above: where two\n"
+        "or more personas agree on a gate use that status; where only one evaluated it\n"
+        "use that status; where they disagree take the LOWEST (most conservative) status\n"
+        "and show both perspectives in your justification.\n\n"
+        "Do NOT compute scores. `raw_score`, `fix_status` and `merge_readiness` are\n"
+        "recomputed on the host from the gate statuses you report, and the values you\n"
+        "put in those fields are ignored."
     )
 
 
@@ -160,7 +333,32 @@ def _load_system_prompt(config: Config, path_cfg: object) -> str | None:
     if not prompt_file:
         return None
     path = config.paths.prompts_dir / prompt_file
-    return path.read_text() if path.exists() else None
+    if not path.exists():
+        return None
+    return (
+        f"{path.read_text().rstrip()}\n\n"
+        f"{_synthesis_section(config)}\n\n"
+        f"{_rules_section(config)}\n"
+    )
+
+
+_STRUCTURED_RETRY_SUBTYPE = "error_max_structured_output_retries"
+
+
+def _failure_reason(terminal: HarnessResult | None, exit_code: int) -> str:
+    """Build an operator-actionable reason from the terminal result."""
+    if terminal is None:
+        return f"validation session produced no terminal result (exit={exit_code})"
+    parts = [f"validation session ended with subtype={terminal.subtype!r}"]
+    if terminal.subtype == _STRUCTURED_RETRY_SUBTYPE:
+        parts.append(
+            "the model never returned a response matching the validation schema -- "
+            "either schema-validation retries were exhausted, or a model fallback "
+            "retracted the response and no retry replaced it"
+        )
+    if terminal.errors:
+        parts.append("errors: " + " | ".join(str(e) for e in terminal.errors))
+    return " -- ".join(parts)
 
 
 async def _run_and_check(
@@ -169,12 +367,18 @@ async def _run_and_check(
     options: StreamingOptions,
     session_id: str,
     log_dir: Path,
+    workspace: Path,
+    tracking_ids: list[str],
+    host_gate_synthesis: bool = True,
 ) -> int:
     """Stream the session, log it, and raise ValidationSessionError on failure."""
+    # Log the live stream (session.jsonl is flushed line-by-line as messages
+    # arrive, tailable during the run) while collecting messages so the terminal
+    # HarnessResult can be recovered afterwards -- no nonlocal closure needed.
+    messages: list[HarnessMessage] = []
     try:
-        messages = harness.run_streaming(prompt, options)
         exit_code, observed_sid = await stream_and_log(
-            messages,
+            _log_stream(harness.run_streaming(prompt, options), messages),
             log_dir=log_dir / ORCHESTRATOR_LOG_DIRNAME,
             session_id=session_id,
             live=False,
@@ -187,14 +391,58 @@ async def _run_and_check(
             cause=e,
             exit_code=getattr(e, "exit_code", None),
         ) from e
+    terminal = next(
+        (m for m in reversed(messages) if isinstance(m, HarnessResult)), None
+    )
+    # The exit-code check precedes both artifact writes: a failed session must leave no
+    # verdict in the workspace. write_back_validation reads these two files, so persisting
+    # them first let a failed run fold a terminal "validated" status into the DTO -- a
+    # status excluded from re-validation. The caller attempts best-effort redacted
+    # transcript persistence before deleting the workspace, but no transcript is guaranteed.
     if exit_code != 0:
         log.error("Session %s exited with code %d", session_id, exit_code)
         raise ValidationSessionError(
-            "validation session returned non-success",
+            _failure_reason(terminal, exit_code),
+            exit_code=exit_code,
+        )
+    if terminal is not None and terminal.structured is not None:
+        _write_validation_outputs(workspace, terminal.structured)
+    # Backends whose subagents return schema-validated reports get deterministic
+    # host synthesis from the terminal graph state, overwriting the gates the
+    # orchestrator emitted. Elsewhere the orchestrator's own gates are the only
+    # validated ones, so leave what it returned in place.
+    if host_gate_synthesis and terminal is not None and terminal.state is not None:
+        _write_host_synthesized_gates(workspace, terminal.state, tracking_ids)
+    # A "success" result can still carry nothing to persist. state only counts where
+    # host synthesis actually writes from it; elsewhere it is set but unused, and
+    # checking it would mask exactly the empty-verdict case this guard exists for.
+    if (
+        terminal is not None
+        and terminal.structured is None
+        and (not host_gate_synthesis or terminal.state is None)
+    ):
+        raise ValidationSessionError(
+            "validation session reported success but returned no structured output "
+            "and no terminal state; no validation_report.json could be written",
             exit_code=exit_code,
         )
     log.debug("Session %s completed (observed_sid=%s)", session_id, observed_sid)
     return exit_code
+
+
+async def _log_stream(
+    source: AsyncIterator[HarnessMessage],
+    collected: list[HarnessMessage],
+) -> AsyncIterator[HarnessMessage]:
+    """Yield each streamed message while appending it to *collected*.
+
+    Lets ``stream_and_log`` drive the live session (writing/flushing session.jsonl
+    per message) in a single pass, while the caller keeps every message to recover
+    the terminal ``HarnessResult`` afterwards.
+    """
+    async for msg in source:
+        collected.append(msg)
+        yield msg
 
 
 async def launch_session(
@@ -205,7 +453,8 @@ async def launch_session(
     harness: Harness | None = None,
 ) -> int:
     """Run a fix-validation session and return the exit code (0 on success)."""
-    inject_claude_config(workspace_dir)
+    if _injects_claude_config(config):
+        inject_claude_config(workspace_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     path_cfg = VALIDATION_PATHS[resolve_path(manifest.validation_path)]
     options = build_validation_options(
@@ -219,10 +468,20 @@ async def launch_session(
         "Launching validation session %s for %s in %s",
         manifest.session_id, manifest.jira_key, workspace_dir,
     )
+    tracking_ids = list(manifest.finding_ids)
+    if (
+        manifest.finding is not None
+        and manifest.finding.tracking_id
+        and manifest.finding.tracking_id not in tracking_ids
+    ):
+        tracking_ids.append(manifest.finding.tracking_id)
     return await _run_and_check(
-        harness=harness if harness is not None else get_harness(config.claude.via),
+        harness=harness if harness is not None else get_harness(config.agent.via),
         prompt=build_launch_prompt(manifest),
         options=options,
         session_id=manifest.session_id,
         log_dir=workspace_dir / LOGGING_DIRNAME,
+        workspace=workspace_dir,
+        tracking_ids=tracking_ids,
+        host_gate_synthesis=_synthesizes_gates_on_host(config),
     )

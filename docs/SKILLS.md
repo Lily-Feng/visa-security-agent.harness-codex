@@ -88,7 +88,7 @@ also run automatically at the end of `scan` (an 11-step run):
 
 An optional **`autoexclude`** role (`s1_autoexclude.py`, 367 LOC) runs ahead of
 s1 when `--auto-step1` is passed **or** when `step1.auto_exclude` is truthy in
-the active profile — and the shipped profiles (`default`, `sdk`, `full`) all set
+the active profile — and the shipped profiles (`default`, `sdk`, `full`, `taint`) all set
 `auto_exclude: true`, so it runs by default unless disabled with
 `--no-auto-step1` (which wins over both) or by supplying `--step1-config` (an
 explicit Step-1 overlay also suppresses the auto-derivation). It is a cheap
@@ -145,9 +145,51 @@ web-templates, Zig.
 
 ---
 
+## 6. Taint analysis engine
+`vvaharness/taint/` — structured dataflow evidence layered on top of the s1/s3 call graph.
+
+The engine produces **typed transfer edges** (not just reachability hops) that trace how tainted data moves through code. Evidence is attached to each finding as a labelled step sequence so s4 and s6 reason over full paths, not summaries.
+
+### Transfer edge types
+
+| Edge type | Meaning |
+|---|---|
+| `assign` | Direct assignment or local alias (`x = tainted`) |
+| `arg_to_param` | Argument passed into a callee — interprocedural |
+| `return_to_local` | Callee return value captured — interprocedural |
+| `field_write` | Taint stored to an object field or attribute |
+| `field_read` | Taint loaded from an object field or attribute |
+| `container_put` | Taint inserted into a list, dict, set, or array |
+| `container_get` | Taint extracted from a container |
+| `sanitize` | Explicit neutralization — flow is suppressed from findings |
+| `condition` | Branch-gated taint (propagates only along a specific CFG branch) |
+| `reflect` | Dynamic dispatch via reflection. **Java:** `getMethod`/`getDeclaredMethod`/`getDeclaredField`/`forName`/`invoke`/`newInstance`/`MethodHandles.lookup()`. **Python:** `getattr`/`setattr`/`__import__`/`eval`/`exec`/`compile`/`vars`/`type`. **C#:** `GetMethod`/`GetType`/`Invoke`/`CreateDelegate`/`Activator.CreateInstance`/`Assembly.Load`/`Type.InvokeMember`. |
+| `framework` | Framework lifecycle source — parameter injected by the runtime |
+| `source` | Marks the initial taint source |
+| `return_to_sink` | Return value flowing directly to a sink |
+| `local_to_sink` | Local variable flowing directly to a sink |
+
+### Source detection — automatic, no annotation required
+
+| Source type | Detected in |
+|---|---|
+| HTTP request parameters | Django (`request.GET`/`POST`), Spring (`@RequestParam`, `@PathVariable`, `@RequestBody`), ASP.NET (`Request.QueryString`, `Request.Form`, `Request["…"]`) |
+| URL route parameters | Spring `@GetMapping`/`@PostMapping` path variables, Django `urlpatterns` captures, ASP.NET `[HttpGet("{id}")]` route templates |
+| Response output | Django `HttpResponse`/`JsonResponse`, Spring `ResponseEntity`/`@ResponseBody`, ASP.NET `Content`/`Write` sinks — flagged as potential XSS risk |
+
+**Sanitized paths are suppressed.** When the engine detects an explicit sanitizer on a flow (e.g. `escape()`, `sanitize()`, encoder calls), the flow is removed from findings rather than surfaced as a false positive.
+
+**Reflection and dynamic dispatch** are identified with `reflect` edges so the LLM can assess whether reflection bypasses a sanitizer or widens attack surface.
+
+**Field and container flow** — taint is tracked through object attributes, dict/list put/get, and local aliases so multi-hop paths through data structures are not silently dropped.
+
+**Languages: Python, Java, C#** for all of the above.
+
+---
+
 ### Known limitation
-The call graph that feeds taint (s3) and reachability is built from an LLM seed
-hardened by a deterministic regex supplement — a *textual* graph, not a parsed
-one. It resolves plain calls well but can miss dynamic dispatch, interface/OOP
-dispatch, reflection, and framework routing. Treat findings as triage
-candidates requiring human review.
+The call graph is a textual/AST-hybrid — it resolves plain calls and
+interprocedural flows well for direct and attribute-chained calls. Highly
+dynamic patterns (runtime class loading, bytecode manipulation, interface/OOP
+dispatch through deep polymorphism) remain partially modelled. Treat findings
+as triage candidates requiring human review.

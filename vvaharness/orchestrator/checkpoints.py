@@ -31,6 +31,7 @@ but the bytes on disk are the same ``TypeAdapter.dump_json()`` output and
 the same validate-on-load gate applies.
 """
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -60,7 +61,12 @@ _S7Ckpt = tuple[list[DroppedFinding],   # pre_dropped
                 list[DroppedFinding]]   # dup_dropped
 
 
+from vvaharness.pipeline.stages.s0_seed import SeedPackage
+
 _STEP_SCHEMA: dict[str, TypeAdapter] = {
+    # s0 is a plain @dataclass; TypeAdapter serialises it (incl. the Path field)
+    # to JSON and rebuilds it on load — same no-pickle guarantee as the rest.
+    "s0": TypeAdapter(SeedPackage),
     "s1": TypeAdapter(ContextPackage),
     "s2": TypeAdapter(ThreatModel),
     "s3": TypeAdapter(TaskManifest),
@@ -176,17 +182,28 @@ def load_ckpt(ckpt_dir: Path, run_id: str, step: str):
     try:
         obj = _schema_for(step).validate_json(payload)
     except (ValidationError, ValueError) as e:
-        # Two cases degrade the same safe way — re-run the step instead of
-        # crashing or trusting a bad payload:
-        #   * corrupt / non-JSON bytes (json.JSONDecodeError, a ValueError
-        #     subclass);
-        #   * checkpoint written by a different tool version whose model
-        #     fields have moved/renamed, or a tampered payload whose values
-        #     fail a field validator (ValidationError).
-        # In every case the bytes are inert data — there is no code-execution
-        # path, so "untrusted" here means only "schema-invalid".
-        print(f"  [ckpt] WARN: {step} unreadable, version-mismatched, or "
-              f"untrusted ({e}); ignoring and re-running", file=sys.stderr)
+        # Both branches degrade the same safe way — re-run the step instead of
+        # crashing or trusting a bad payload — but the diagnostics differ, and
+        # the only distinction the bytes actually support is "is this valid
+        # JSON at all?". Payloads carry no schema-version field and no
+        # signature, so a version bump cannot be told apart from a value-level
+        # tamper once the JSON parses; claiming otherwise would be fiction.
+        try:
+            json.loads(payload)
+        except (ValueError, TypeError):
+            # Not even well-formed JSON: truncated, corrupt, or a substituted
+            # non-checkpoint blob — i.e. genuinely unreadable and untrusted.
+            print(f"  [ckpt] WARN: {step} unreadable — payload is not valid "
+                  f"JSON (corrupt or untrusted) ({e}); ignoring and "
+                  f"re-running", file=sys.stderr)
+        else:
+            # Well-formed JSON that fails the pydantic schema: almost always a
+            # checkpoint written by a different tool version whose model
+            # fields moved/renamed (a value-level tamper is indistinguishable
+            # here and equally inert). Not a tampering signal on its own.
+            print(f"  [ckpt] WARN: {step} schema mismatch — likely written by "
+                  f"an incompatible tool version ({e}); discarding and "
+                  f"re-running", file=sys.stderr)
         return None
     print(f"  [ckpt] resumed {step} from db", file=sys.stderr)
     return obj

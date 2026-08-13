@@ -16,6 +16,102 @@ limitations under the License.
 
 # Changelog
 
+## [1.2.0] — 2026-08-04
+
+This release ships four headline improvements across the full pipeline. **AST
+callgraph** — a tree-sitter-backed static seed stage (S0) can build
+source→sink call graphs before the agentic explorer runs from operator-supplied
+generated rule files or optional LLM-derived specs. No source/sink rule pack is
+bundled, so shipped rules mode returns an empty seed when those files are
+absent. **DeepAgents backend** —
+remediation (S10) and validation (S11) were refactored onto a shared harness
+backend layer with first-class DeepAgents/provider routing, structured-output
+strategies, and read-only enforcement. **Multi-model support** — a new
+`taint.yaml` profile adds model role slots for callgraph annotation (`graph_annotate`,
+`callgraph_creation`) alongside upgraded Opus-tier deepdive/verify roles;
+`default.yaml` also gains S0 callgraph with `step1.call_graph: tree_sitter`.
+**Observability** — `scan_progress` is enabled in compact mode by the default
+profile and verbose mode by the taint profile (disabled in `sdk.yaml` and
+`full.yaml`). Stage events span S0–S9; detailed file/threat/chunk events come
+from S1, S2, S3, and S4.
+
+### Added
+- **Step 0 static seed stage (`s0_seed`).** Tree-sitter-backed source→sink
+  callgraph seeding runs before the agentic explorer with no external binary
+  required. Rules mode loads operator-supplied generated source/sink YAML; no
+  generated corpus or implicit heuristic baseline is bundled. With no usable
+  rule files it returns an empty seed and later stages continue. The S0 wrapper
+  is enabled in both `default.yaml` and `taint.yaml`.
+- **Callgraph engine package** under
+  `vvaharness/pipeline/stages/callgraph_engine/` — rule translation, graph
+  construction, AST scanning, and an optional LLM annotator mode
+  (`callgraph_detection: llm`) that falls back to configured rule YAML.
+- **Rule corpus tooling** under `vvaharness/rules/` — `generic_pack.py`
+  generates the first-party `generic.kb.yaml` CWE knowledge pack, while
+  `build_kb.py` can compile Semgrep, FindSecBugs, and CodeQL inputs into that KB
+  format and optional external source/sink callgraph rule packs. TypeScript
+  graph support was added in `vvaharness/lang/ts_graph.py`.
+- **Shared harness backend** (`vvaharness/backends/harness/`) — a single
+  abstraction layer for the DeepAgents provider including client, options, tool
+  translation, redaction, and read-only session enforcement, consumed by both
+  S10 remediation and S11 validation.
+- **New taint-first profile (`taint.yaml`)** with `step0.enabled: true`,
+  `step1.mode: gap_fill`, `step3.catchall_mode: reachable_only`, and dedicated
+  model roles `graph_annotate` / `callgraph_creation` plus upgraded Opus-tier
+  `deepdive` and `verify`. Its shipped rules mode needs operator-supplied rule
+  files for an S0 seed; an empty seed follows the normal agentic S1 path.
+- **Profile-controlled `scan_progress`.** `default.yaml` ships enabled/compact
+  and `taint.yaml` enabled/verbose; `sdk.yaml` and `full.yaml` ship disabled.
+  Stage-start/done/note events cover S0–S9, with file/threat/chunk detail in
+  S1/S2/S3/S4.
+- **Remediation path/rules helpers** (`remediation_agent/rule_paths.py`) and
+  bundled validation scoring resources (not staged as a DeepAgents skill).
+- **Expanded test suites** covering S0 seed, callgraph engine, reachable-only
+  chunking, taint-path handling, KB compilation, DeepAgents backend routing,
+  read-only enforcement, structured-output handling, and validation consensus.
+
+### Changed
+- **Python support floor raised to 3.11.** DeepAgents cannot install on Python
+  3.10, and the shipped default routes S10/S11 through DeepAgents, so package
+  metadata and tooling now require Python 3.11 or newer.
+- **`default.yaml` gains S0 callgraph.** `step0.enabled: true` and
+  `step1.call_graph: tree_sitter` are now set in the default profile. Because no
+  source/sink pack is bundled, the rules-mode S0 wrapper returns an empty seed
+  unless the operator supplies generated rule files; S1 still runs normally.
+- **Pipeline wiring across S1–S8** updated to consume S0/callgraph artifacts
+  directly, improving the reachability context fed into decompose, deep-dive,
+  and verify.
+- **Validation backend abstractions hoisted** into `vvaharness/backends/harness`;
+  the previous `vvaharness/validation/backends/` subtree was refactored and moved.
+- **S11 validation routing hardened** — single-vendor panel enforcement,
+  rejection of invalid startup routes, normalization of legacy `via: openai`
+  validation roles to DeepAgents with the OpenAI provider, and per-backend
+  structured-output strategy selection.
+- **S11 runtime and scoring reorganized** — session, synthesis, tooling, and
+  scoring modules restructured; dead/contradictory scoring CLI paths removed.
+- **S10 remediation updated for DeepAgents** — plugin-runner/policy plumbing,
+  virtual-path handling, and packaged policy/rule delivery revised.
+- **Checkpoint/store/config plumbing** extended for S0/callgraph artifacts and
+  taint-profile runtime behavior.
+- **Default/full/sdk profiles, remediation and validation docs** updated for the
+  revised S10/S11 backend behavior and new credential requirements.
+
+### Fixed
+- **Callgraph and AST robustness** — parser-driven edge extraction fallback
+  handling and reachability/taint-path correctness across decomposition,
+  prefiltering, verification, and dedup.
+- **Validation verdict integrity** — failed S11 sessions can no longer produce
+  a terminal `validated` outcome; scoring paths that could inflate a failed fix
+  were closed.
+- **In-scan validation scope** — Step 11 now correctly honors
+  `step_validate.max_findings` during `scan` execution.
+- **Remediation setup and policy delivery** — missing inputs discovered earlier;
+  policy/rule resources delivered correctly via the updated DeepAgents backend.
+- **Stage-level progress events wired for all stages S0–S9** in the scan
+  orchestrator, with completed/cached/skipped/error outcomes for both taint and
+  non-taint profiles. The current stage wrapper passes S0–S11 as `n=0..11`
+  with `total=11`; it does not display one-based `[1/12]..[12/12]` slots.
+
 ## [1.1.0] — 2026-06-30
 
 This release extends vvaharness past detection into a full remediate-and-validate
@@ -47,8 +143,9 @@ and a redaction fix; everything new is layered on top of it.
   SARIF under `<repo>/security-scan/` are never touched.
 - **Remediation and validation run by default at the end of `scan`.** The shipped
   default profile sets `step_remediate.enabled` and `step_validate.enabled`, so a
-  plain `scan` continues past S9 into **S10 — Remediate** (fix mode: it edits source
-  files in the target repo) and **S11 — Validate**. New scan flags `--remediate`
+  plain `scan` continues past S9 into **S10 — Remediate** (fix mode can edit
+  source files when findings, credentials, and a successful session are present)
+  and **S11 — Validate**. New scan flags `--remediate`
   (force it on) and `--top N`; pass `--stop-after s9` for detection only.
 - **New configuration surface.** `step_remediate` / `step_validate` profile blocks
   (enabled flags, budgets, turn caps, `allowed_tools`, finding caps), new

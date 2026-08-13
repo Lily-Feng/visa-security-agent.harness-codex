@@ -26,7 +26,7 @@ from vvaharness.validation.models import (
     ValidationResult,
     make_unverifiable,
 )
-from vvaharness.validation.plans import FixValidationPlan
+from vvaharness.validation.models.plans import FixValidationPlan
 from vvaharness.validation.session.errors import ValidationSessionError
 from vvaharness.validation.session.launcher import launch_session
 

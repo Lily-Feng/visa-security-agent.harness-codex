@@ -30,14 +30,20 @@ from vvaharness.util.json_extract import extract_json
 from vvaharness.util.prompts import SEVERITY_GUIDANCE
 from vvaharness.util import errlog as _errlog
 from vvaharness.report.redact import redact
+from vvaharness.pipeline.callgraph_consumer import graph_view, qnodes_at
+from vvaharness.pipeline.stages.s1_preprocess import q_file
 
-SYSTEM = f"""You are an exploit development strategist reviewing a complete set
-of vulnerability findings. Your job is NOT to find new bugs — it's to assess
-what an attacker can actually DO with these bugs together.
+SYSTEM = f"""You are an exploit development strategist reviewing verified findings
+that have ALREADY PASSED adversarial verification by a security expert. Each finding
+carries a TRUE_POSITIVE verdict, confidence level, and CVSS vector — use this as
+authoritative ground truth. Your job is NOT to re-verify bugs or judge exploitability
+directly — it's to assess what an attacker can actually DO with these bugs TOGETHER,
+and to rank them by chaining opportunity.
 
-For each finding, assign true severity considering:
+For each finding, reassess only the CHAIN potential given:
 - Is it pre-auth or post-auth? (check design controls)
-- Is it sandboxed? (check design controls)
+- Can a prior finding (or external source) supply input to this sink?
+- Does a prior finding's output become this finding's input?
 - What primitive does it give? (read, write, control flow, leak, DoS only)
 
 Then look for CHAINS — combinations more dangerous than any single bug:
@@ -45,16 +51,17 @@ Then look for CHAINS — combinations more dangerous than any single bug:
 - UAF + type confusion = arbitrary write
 - Logic flaw bypassing auth + post-auth bug = pre-auth exploit
 - New finding + known unpatched CVE = combined attack
+- Reachability: Finding #A flows to Finding #B via call-graph if they share
+  function neighborhoods or data flow (check the "reachability" block per finding).
 
 If a design control genuinely blocks a chain, say so and downrank it.
 
-{SEVERITY_GUIDANCE}
-
-Map your assessment onto the output enum as:
-CRITICAL → critical; HIGH → high; MEDIUM → medium; LOW → low; no exploit path → info.
-Anchor severity to the CVSS vector attached to each finding (when present): the
-qualitative band of the CVSS base score is authoritative — Critical 9.0-10.0,
-High 7.0-8.9, Medium 4.0-6.9, Low 0.1-3.9.
+Rank each finding primarily by its CVSS base score (verifier already validated it):
+- CRITICAL (9.0-10.0): likely a standalone problem needing immediate patching
+- HIGH (7.0-8.9): serious but may be blocked by pre-auth, sandboxing, or require a chain
+- MEDIUM (4.0-6.9): chaining or multi-stage is common; look for it
+- LOW (0.1-3.9): useful only in chain or as a stepping stone
+- INFO: no standalone or chained exploit path visible
 
 Respond with ONLY a JSON object:
 {{
@@ -77,6 +84,51 @@ Respond with ONLY a JSON object:
   ]
 }}
 The 'index' and 'steps' values are 0-based indices into the findings list."""
+
+
+def _reachability_for_finding(f: Finding, ctx: ContextPackage) -> str:
+    """Compact reachability signature for chaining: shows source/sink refs and
+    candidate call-graph neighborhoods to help the chain LLM spot data flow."""
+    graph = ctx.call_graph or {}
+    if not graph:
+        parts = []
+        if f.source_ref:
+            marker = " (inferred from AST, unverified)" if "source_ref" in f.backfilled_refs else ""
+            parts.append(f"source={f.source_ref}{marker}")
+        if f.sink_ref:
+            marker = " (inferred from AST, unverified)" if "sink_ref" in f.backfilled_refs else ""
+            parts.append(f"sink={f.sink_ref}{marker}")
+        return " ".join(parts) if parts else "(no graph context)"
+
+    # Shared, call-graph-first resolution + per-run reverse index, so the
+    # chain builder, verifier and deduper agree on reachability for the same
+    # finding.
+    view = graph_view(ctx)
+    cands = qnodes_at(view, f.file or "",
+                      int(f.line_start or 1), int(f.line_end or f.line_start or 1),
+                      limit=6)
+
+    parts = []
+    if f.source_ref:
+        marker = " (inferred from AST, unverified)" if "source_ref" in f.backfilled_refs else ""
+        parts.append(f"source={f.source_ref}{marker}")
+    if f.sink_ref:
+        marker = " (inferred from AST, unverified)" if "sink_ref" in f.backfilled_refs else ""
+        parts.append(f"sink={f.sink_ref}{marker}")
+
+    if cands:
+        qn = cands[0]
+        callers = (view.rev.get(qn) or [])[:3]
+        callees = (graph.get(qn) or [])[:3]
+        reachable = []
+        if callers:
+            reachable.append(f"called-by: {', '.join(callers[:2])}")
+        if callees:
+            reachable.append(f"calls: {', '.join(callees[:2])}")
+        if reachable:
+            parts.append("neighbors=" + "; ".join(reachable))
+
+    return " ".join(parts) if parts else "(no reachability data)"
 
 
 def run(findings: list[Finding], ctx: ContextPackage, cfg, *,
@@ -119,7 +171,7 @@ def run(findings: list[Finding], ctx: ContextPackage, cfg, *,
                     f"{len(findings)} verified findings reported unranked.",
         )
 
-    # HB-009 recoverability: persist the FULL raw chain response next to the
+    # Recoverability: persist the FULL raw chain response next to the
     # errors log BEFORE parsing, so a parse/hydration failure is salvageable
     # offline without re-spending the s8 call. Best-effort — never let a disk
     # error here crash the final pipeline step.
@@ -366,12 +418,14 @@ def _build_prompt(findings: list[Finding], ctx: ContextPackage) -> str:
         cvss = f.cvss_vector or "n/a"
         verified = (f"{f.verdict} {f.verdict_confidence}/10"
                     if f.verdict else "unverified")
+        reachability = _reachability_for_finding(f, ctx)
         blocks.append(
             f"[{i}] {f.vuln_class.value} @ {f.file}:{f.line_start}-{f.line_end}\n"
             f"    Title: {f.title}\n"
             f"    CVSS: {cvss}  |  Verified: {verified}\n"
             f"    Confidence: {f.confidence:.2f} ({f.votes} runs agreed)\n"
             f"    {f.description}\n"
+            f"    Reachability: {reachability}\n"
         )
     findings_block = "\n".join(blocks)
 

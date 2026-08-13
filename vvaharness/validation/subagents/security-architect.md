@@ -5,10 +5,15 @@ allowedTools:
   - Read
   - Grep
   - Glob
-  - Bash
+  - DiffTouched
+  - ChangedLines
+  - DiffImpactMap
+  - PatternScan
+  - TestInventory
 deniedTools:
   - Write
   - Edit
+  - Bash
   - Agent
 ---
 <!--
@@ -47,38 +52,37 @@ Analyze whether the fix addresses the vulnerability at the right architectural l
 
 ## Criterion Evaluation
 
-Evaluate these 4 criteria independently:
+Evaluate these 4 criteria independently.
 
-1. **root_cause** (weight: 0.43): Does the fix address the root cause? Is the vulnerable code path properly mitigated with correct architectural approach?
-2. **instance_coverage** (weight: 0.2467): Are ALL files and code paths containing the vulnerable pattern covered? Are similar patterns in sibling files/modules also fixed?
-3. **no_new_vulnerabilities** (weight: 0.1867): Does the fix introduce any new security issues? New injection points, error handling gaps, bypass methods?
-4. **security_best_practices** (weight: 0.1366): Does the fix use framework-recommended patterns (parameterized queries, proper encoding, input validation)? Is it at the right architectural layer?
+Use the deterministic fact tools when they help ground your reasoning:
+- **DiffTouched** / **ChangedLines** to anchor claims to what diff.patch actually changed.
+- **DiffImpactMap** to see whether trust-boundary files are touched.
+- **PatternScan("secret_exposure")** / **PatternScan("insecure_value")** to verify claims about creds or insecure config values.
+- **TestInventory** to judge whether negative/adversarial regression tests exist.
+
+Do NOT compute a score, a verdict, or synthesize other personas. Emit only your own per-gate qualitative judgment.
 
 For each criterion: status must be "pass", "partial", "fail", or "skip".
 Criteria without evidence MUST be "skip", never "pass" or "fail".
 
 ## Output Format
 
-Return JSON:
+Return a single `PersonaReport` JSON object with this exact shape:
 ```json
 {
   "persona": "security-architect",
-  "findings": [
+  "tracking_id": "...",
+  "gates": [
     {
-      "tracking_id": "...",
-      "gates": [
-        {
-          "gate_name": "root_cause",
-          "status": "pass|partial|fail|skip",
-          "summary": "one-line assessment",
-          "evidence": [{"file": "path", "line": 42, "snippet": "code"}],
-          "details": "extended analysis"
-        },
-        {"gate_name": "instance_coverage", "status": "...", "summary": "...", "evidence": [], "details": "..."},
-        {"gate_name": "no_new_vulnerabilities", "status": "...", "summary": "...", "evidence": [], "details": "..."},
-        {"gate_name": "security_best_practices", "status": "...", "summary": "...", "evidence": [], "details": "..."}
-      ]
-    }
+      "gate_name": "root_cause",
+      "status": "pass|partial|fail|skip",
+      "summary": "one-line assessment",
+      "evidence": [{"file": "path", "line": 42, "snippet": "code"}],
+      "details": "extended analysis"
+    },
+    {"gate_name": "instance_coverage", "status": "...", "summary": "...", "evidence": [], "details": "..."},
+    {"gate_name": "no_new_vulnerabilities", "status": "...", "summary": "...", "evidence": [], "details": "..."},
+    {"gate_name": "security_best_practices", "status": "...", "summary": "...", "evidence": [], "details": "..."}
   ]
 }
 ```

@@ -91,37 +91,74 @@ def _deep_merge(base: dict, over: dict) -> dict:
 # intentionally omitted — the stages already default those internally and a
 # defaults-layer entry would interfere with their append/merge semantics.
 _STEP_DEFAULTS: dict = {
+    "step0": {
+        # Profile-controlled static seed. The scalar fallback is disabled;
+        # default.yaml and taint.yaml explicitly enable it. Rules mode requires
+        # source/sink YAML; without applicable rules it returns an empty seed.
+        "enabled": False,
+        "callgraph_detection": "rules",
+        "sources_yaml": None, "sinks_yaml": None,
+        # Optional static-seed language filter (s0_seed._filter_step0_languages).
+        "languages": None,
+    },
     "step1": {
         "max_budget_usd": 25.0, "max_turns": 40, "max_file_kb": 1024,
+        "mode": "full", "call_graph": "regex",
         "call_graph_validate": True, "call_graph_supplement": True,
         "call_graph_rounds": 4, "call_graph_max_targets": 3,
+        # Opt-in LLM auto-exclusion pass (s1_autoexclude): when enabled, an
+        # extra model call proposes scan exclusions from a repo survey.
+        # auto_exclude_max_tokens caps that survey prompt.
+        "auto_exclude": False, "auto_exclude_max_tokens": 8000,
+        # Back-compat symlink toggle: off-root symlink targets are dropped
+        # regardless; when set, s1 warns rather than silently honouring it.
+        "follow_symlinks": False,
     },
     "step2": {
         "enabled": True, "max_tokens": 64000, "max_threats": 50,
         "baseline": "auto", "max_doc_chars": 20000, "max_manifest_chars": 4000,
         "max_modules": 100, "max_entry_points": 400, "max_config_reps": 80,
         "max_api_artefacts": 100,
+        "max_graph_files": 220, "max_graph_sinks": 80, "max_graph_edges": 100,
+        "max_notes_chars": 2500, "max_function_sites": 80,
+        # Prompt-truncation caps, distinct from the frontier-view caps above
+        # (max_modules / max_entry_points).
+        "max_prompt_modules": 100, "max_prompt_entry_points": 400,
     },
     "step3": {
         "max_tokens": 64000, "timeout": 3600, "taint_chunks": True,
         "taint_max_hops": 10, "taint_max_chunks": 60, "taint_files_per_hop": 5,
         "pack_by": "loc", "chunk_token_budget": 180000,
         "chunk_overhead_tokens": 80000, "risk_chunk_loc": 10000,
-        "catchall_enabled": True, "catchall_chunk_loc": 4000,
+        "catchall_enabled": True, "catchall_mode": "all", "catchall_chunk_loc": 4000,
         "catchall_max_files": 100, "max_files_per_chunk": 80,
-        "specialist_chunk_loc": 10000,
+        "specialist_chunk_loc": 10000, "taint_chunk_slice": "file",
+        "max_prompt_files": 180, "max_prompt_entry_points": 60,
+        "max_prompt_sinks": 80, "max_prompt_modules": 24,
+        "max_prompt_call_edges": 80, "max_prompt_notes_chars": 2500,
+        "catchall_reachable_min_ratio": 0.0, "catchall_reachable_min_files": 0,
     },
     "step4": {
-        # Single-pass by default — matches every shipped profile. Majority
-        # voting is an explicit opt-in: set runs>1 AND point models.deepdive at
+        # Single-pass scalar default. sdk.yaml and full.yaml opt into majority
+        # voting by setting runs>1 and pointing models.deepdive at
         # a temperature-capable sdk/openai model, else _effective_runs() (see
         # s4_deepdive) forces 1/1.
         "parallel": 5, "timeout": 1800, "runs": 1, "vote_threshold": 1,
         "specialist_runs": 1, "line_bucket": 10, "max_findings_per_run": 10,
         "max_tokens": 64000, "neighbor_context_lines": 25,
         "neighbor_context_max": 50,
+        # taint-first overrides — all no-ops under default.yaml so the legacy
+        # path is byte-identical: discover prompt, no per-kind run override,
+        # no per-kind model override.
+        "taint_prompt_mode": "discover", "taint_runs": None, "taint_model": None,
+        # Optional override of step3.taint_chunk_slice. Left None so the
+        # effective mode is read from step3; set to "file"/"function" here to
+        # override the chunk slicing mode for the deep-dive stage only.
+        "taint_chunk_slice": None,
+        "frontier_max_funcs_per_file": 24, "frontier_fallback_head_lines": 80,
     },
-    "step5_prefilter": {"min_pre_confidence": 0.6, "require_evidence": True},
+    "step5_prefilter": {"min_pre_confidence": 0.6, "require_evidence": True,
+                        "ast_backfill_evidence": True},
     "step6_verify": {
         "parallel": 5, "min_confidence": 7, "max_budget_usd": 10.0,
         "max_turns": 30,
@@ -131,6 +168,12 @@ _STEP_DEFAULTS: dict = {
     "step_remediate": {"max_budget_usd": 10.0, "max_turns": 40,
                        "top_n_findings": 20},
     "step_validate": {"enabled": False, "effort": "high", "max_turns": 50, "max_budget_usd": 15.0, "max_findings": 20},
+    "output": {"emit_unreachable_appendix": False},
+    # CWE knowledge-base overlays. kb_overlays is an operator-supplied path (or
+    # list of paths) to extra rules/*.kb.yaml corpora spliced onto the built-in
+    # KB by CweKB.load(overlays=...) for the s4 confirm/refute prompt. None ⇒
+    # built-in KB only.
+    "rules": {"kb_overlays": None},
 }
 
 

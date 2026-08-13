@@ -29,13 +29,18 @@ Two passes:
 """
 from __future__ import annotations
 import json
+import logging
 import re
 import sys
 
-from vvaharness.models import Finding, DroppedFinding, DupLocation
+log = logging.getLogger(__name__)
+
+from vvaharness.models import ContextPackage, Finding, DroppedFinding, DupLocation, VulnClass
 from vvaharness.backends.llm import prompt
 from vvaharness.util import errlog as _errlog
 from vvaharness.report.redact import redact
+from vvaharness.pipeline.callgraph_consumer import graph_view, qnodes_at, neighborhood
+from vvaharness.pipeline.stages.s1_preprocess import q_file
 
 
 def _make_dup_location(f: Finding, reasoning: str) -> DupLocation:
@@ -134,6 +139,13 @@ Keep separate (is_duplicate=false) when:
 - Same CWE class repeated independently (e.g. two unrelated string-built SQL
   queries) — each one needs its own patch.
 
+Prefer graph-grounded decisions when graph evidence exists:
+- Shared source_ref/sink_ref or shared function-hop neighborhoods usually
+    indicates one root cause.
+- Distinct source/sink refs and disjoint graph neighborhoods suggest
+    independent bugs.
+- If graph context is missing/sparse, fall back to file+line+description only.
+
 OUTPUT — one line per input index, plain text, this exact grammar:
   index=N is_duplicate=true canonical=M reasoning="one sentence"
   index=N is_duplicate=false canonical=-1 reasoning="one sentence"
@@ -144,6 +156,7 @@ No markdown, no fences, no extra commentary."""
 
 
 _TRIVIAL_REASON = "trivial: same file/class within line tolerance"
+_STRICT_CWE_CLASS = {VulnClass.LOGIC}
 
 
 def _collapse_trivial(findings: list[Finding], line_tol: int) -> dict[int, int]:
@@ -162,6 +175,17 @@ def _collapse_trivial(findings: list[Finding], line_tol: int) -> dict[int, int]:
                 continue
             a, b = findings[i], findings[j]
             if a.file != b.file or a.vuln_class != b.vuln_class:
+                continue
+            # Guard LOGIC bucket: only collapse when CWE is
+            # explicit and equal. Missing CWE at s5 time is common in real
+            # runs; collapsing these pre-s6 can hide true positives.
+            if a.vuln_class in _STRICT_CWE_CLASS:
+                if not a.cwe or not b.cwe or a.cwe != b.cwe:
+                    continue
+            # For narrower classes, keep the previous behavior: explicit CWE
+            # disagreement blocks a collapse; missing CWE can still collapse by
+            # proximity/overlap.
+            elif a.cwe and b.cwe and a.cwe != b.cwe:
                 continue
             close = abs(a.line_start - b.line_start) <= line_tol
             # Overlapping / nested line ranges are the same region re-detected
@@ -203,6 +227,7 @@ def prefilter(findings: list[Finding], line_tol: int
 
 
 def run(verified: list[Finding], cfg, *, label: str = "s7-dedup"
+    , ctx: ContextPackage | None = None
         ) -> tuple[list[Finding], list[DroppedFinding]]:
     """Return (canonical_findings, duplicate_dropped)."""
     if len(verified) <= 1:
@@ -220,7 +245,7 @@ def run(verified: list[Finding], cfg, *, label: str = "s7-dedup"
 
     # ── 7b. Semantic dedup (only if 2+ unresolved) ───────────────────────
     if len(unresolved) >= 2 and getattr(cfg.step7_dedup, "semantic", True):
-        sem = _semantic_dedup(verified, unresolved, cfg)
+        sem = _semantic_dedup(verified, unresolved, cfg, ctx=ctx)
         for local_idx, local_canon, why in sem:
             # Map "local" indices (positions in `unresolved`) back to global.
             g_idx = unresolved[local_idx]
@@ -264,6 +289,7 @@ def run(verified: list[Finding], cfg, *, label: str = "s7-dedup"
 
 
 def _semantic_dedup(verified: list[Finding], unresolved: list[int], cfg
+                    , ctx: ContextPackage | None = None
                     ) -> list[tuple[int, int, str]]:
     """Return list of (local_idx, local_canonical_idx, reasoning) for dups."""
     payload = []
@@ -277,6 +303,9 @@ def _semantic_dedup(verified: list[Finding], unresolved: list[int], cfg
             "title": f.title,
             "description": f.description[:500],
             "exploit_scenario": f.exploit_scenario[:300],
+            "source_ref": f.source_ref,
+            "sink_ref": f.sink_ref,
+            "graph_context": _graph_context_for_finding(f, ctx),
         })
 
     user = ("FINDINGS TO DEDUPLICATE:\n"
@@ -311,3 +340,31 @@ def _parse_dedup_output(raw: str, n: int) -> list[tuple[int, int, str]]:
         if 0 <= canon < idx < n:
             out.append((idx, canon, why))
     return out
+
+
+def _graph_context_for_finding(f: Finding, ctx: ContextPackage | None,
+                               max_qnodes: int = 4,
+                               max_edges_per_node: int = 5) -> dict:
+    """Compact graph signature used by semantic dedup for root-cause grouping."""
+    if ctx is None:
+        return {"available": False}
+
+    graph = ctx.call_graph or {}
+    if not graph:
+        return {"available": False}
+
+    # Shared, call-graph-first resolution + one per-run reverse index, so the
+    # deduper describes graph context identically to s6/s8.
+    view = graph_view(ctx)
+    cands = qnodes_at(view, f.file or "",
+                      int(f.line_start or 1), int(f.line_end or f.line_start or 1),
+                      limit=max_qnodes)
+    around = neighborhood(view, cands, max_edges=max_edges_per_node)
+
+    return {
+        "available": True,
+        "source_ref": f.source_ref,
+        "sink_ref": f.sink_ref,
+        "qnodes": cands,
+        "around": around,
+    }

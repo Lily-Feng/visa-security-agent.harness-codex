@@ -25,10 +25,10 @@ reference, see **[USER_GUIDE.md](USER_GUIDE.md)**.
 
 | Need | Why |
 |---|---|
-| **Python ≥ 3.10** | runtime. The CLI checks the Python version at startup and exits with a clear message on older interpreters. |
+| **Python ≥ 3.11** | required by package metadata. Installers reject older interpreters before any backend is selected. |
 | **git** on `PATH` | only for batch clone mode (`--repo-file`). |
-| **Claude Code CLI, logged in** | the default profile (`default.yaml`) runs every stage through the `claude` subprocess — run `claude` then `/login`, or set `CLAUDE_CODE_OAUTH_TOKEN`. |
-| **An Anthropic API key / OpenAI key** | only if you switch roles to `via: sdk` / `via: openai` (the `sdk.yaml` profile for an all-SDK run, or `full.yaml` for a multi-backend mix — see §5). |
+| **External Claude Code CLI** | required for S1–S9 in `default.yaml` (logged in, or with `CLAUDE_CODE_OAUTH_TOKEN`) and by the current S11 launcher when validation is spelled `via: cli` or `via: sdk`. SDK detection/S10 can use the Agent SDK's bundled executable. |
+| **An Anthropic API key** | required by the shipped `default.yaml` for S10/S11 (`via: deepagents`: `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` for both remediate and validate). An OpenAI key is also required for `sdk.yaml` / `full.yaml` where roles use `via: sdk` / `via: openai`. |
 
 ---
 
@@ -82,13 +82,17 @@ vvaharness --help
 pip install -e .     # editable — code changes take effect without reinstalling
 ```
 
-All installs expose one command, **`vvaharness`**, and bundle all three
-backends (Anthropic SDK, Claude CLI, OpenAI-compatible) — you only need
-credentials for the ones your config actually uses. Dependencies (`pydantic`,
-`pydantic-settings`, `PyYAML`, `anthropic`, `openai`, `httpx`, `urllib3`,
-`python-dotenv`, `typing_extensions`, `claude-agent-sdk`) are
-declared in `pyproject.toml` and resolved by pip; there is no separate
-requirements file.
+All installs expose one command, **`vvaharness`**, and bundle the three
+detection adapters (Anthropic SDK, Claude CLI, OpenAI-compatible) plus the
+DeepAgents/LangGraph harness used by post-scan roles—you only need credentials
+for the routes your config actually uses. Base dependencies
+(`pydantic`, `pydantic-settings`, `PyYAML`, `anthropic`, `openai`, `httpx`,
+`urllib3`, `python-dotenv`, `typing_extensions`, `claude-agent-sdk`,
+`tree-sitter`, `tree-sitter-language-pack`, `deepagents`, `langchain`,
+`langchain-anthropic`, `langchain-openai`, `langgraph`) are declared in `pyproject.toml`
+and resolved by pip — there is no separate requirements file and no extra flags
+needed. The tree-sitter parsers for taint analysis are included in the standard
+install.
 
 > **`vvaharness: command not found`?** The script directory isn't on your PATH.
 > Use a venv (Option B), or fall
@@ -108,21 +112,29 @@ startup, so you do **not** need to `source` it. Variables you export in your
 shell take precedence over `.env` (handy for CI). One safety exception: if the
 discovered `.env` resolves *inside* the `--repo` scan target (an
 attacker-influenced checkout), it is ignored with a warning — set
-`VVAHARNESS_ALLOW_CWD_CONFIG=1` to override. The `.env.example` template
-lists every supported variable:
+`VVAHARNESS_ALLOW_CWD_CONFIG=1` to override. The `.env.example` template lists
+the common credential and endpoint variables:
 
 | Variable | Backend / use |
 |---|---|
 | `CLAUDE_CODE_OAUTH_TOKEN` | `via: cli` — the default profile (alternative to interactive `claude` → `/login`) |
-| `ANTHROPIC_SDK_API_KEY` | `via: sdk` roles (the all-SDK `sdk.yaml` profile, or the `via: sdk` roles in `full.yaml`) |
+| `ANTHROPIC_SDK_API_KEY` | direct `via: sdk` detection roles and `sdk.yaml` S10; it is not translated for S11, which uses external-Claude login/OAuth or standard Anthropic auth |
 | `ANTHROPIC_SDK_BASE_URL` | optional gateway/region override for `via: sdk` |
-| `ANTHROPIC_SDK_CA_CERT` / `ANTHROPIC_SDK_CLIENT_CERT` | optional TLS CA bundle / mTLS client cert for `via: sdk` |
-| `CLAUDE_CLI_CA_CERT` | optional TLS CA bundle for `via: cli` (→ `NODE_EXTRA_CA_CERTS` on the `claude` subprocess) |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_CA_CERT` | `via: openai` |
+| `ANTHROPIC_SDK_CA_CERT` / `ANTHROPIC_SDK_CLIENT_CERT` | optional absolute paths for the direct Anthropic SDK detection transport; not consumed by Agent-SDK S10/S11 |
+| `CLAUDE_CLI_CA_CERT` | optional absolute CA-bundle path for the direct `via: cli` adapter (→ `NODE_EXTRA_CA_CERTS` on its `claude` subprocess) |
+| `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` | DeepAgents with the Anthropic provider (default S10), and one authentication option for Agent-SDK S11 |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_CA_CERT` | key/base URL serve direct `via: openai` and DeepAgents/OpenAI; the CA var serves only the direct adapter and must be an absolute path |
+| `SSL_CERT_FILE` / `SSL_CERT_DIR` / `REQUESTS_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` | generic CA trust overrides honored by the DeepAgents OpenAI-compatible client |
 | `GITHUB_TOKEN` / `GIT_BASE_URL` | batch clone (`--repo-file`) of private repos / URL derivation |
 
-Verify everything is wired up (this also runs a live connectivity probe against
-the configured models):
+Start with the guided, no-spend readiness check:
+
+```bash
+vvaharness setup
+```
+
+After setup is green, optionally verify live connectivity. `doctor` sends a
+small request to configured model backends and therefore spends model tokens:
 
 ```bash
 vvaharness doctor
@@ -151,7 +163,10 @@ Install the Claude Code CLI, then authenticate one of two ways:
 > **Enterprise gateway, in short:** export `ANTHROPIC_BASE_URL=https://<gateway>/`,
 > add `NODE_EXTRA_CA_CERTS=$HOME/cacerts.pem` if it uses a private CA, and
 > `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` if it returns `400 invalid beta flag`.
-> `vvaharness setup` auto-detects the gateway base URL (and CA bundle) and prints these exact lines.
+> `vvaharness setup` prints these exact lines when the active profile uses a `via: sdk`
+> role (for shipped profiles, `sdk.yaml`/`full.yaml`). The shipped default profile has
+> no `via: sdk` roles (`via: cli` for S1-S9 and `via: deepagents` for S10-S11), so
+> set these variables explicitly when your gateway token requires them.
 
 **Base URLs are optional.** If you set only the API key(s) and leave the
 `*_BASE_URL` variables unset, vvaharness uses the official public endpoints
@@ -163,13 +178,18 @@ automatically — it does **not** fail:
 Set a base URL only to point at an internal gateway, a specific region, or any
 OpenAI-compatible endpoint.
 
-**A certificate is _never_ required.** All TLS settings — the `ca_cert` /
+**A certificate is _never_ required for public endpoints.** TLS settings—the `ca_cert` /
 `client_cert` config keys, `verify_ssl`, and every `*_CA_CERT` /
-`*_CLIENT_CERT` env var — are **optional** across all three backends. When
+`*_CLIENT_CERT` env var—are optional for the direct CLI/SDK/OpenAI routes. Use
+absolute paths for certificate env values: after `${VAR}` interpolation the
+value is passed through as-is (a bare string) to `os.path.exists()`/the TLS
+client, so a relative path resolves against the process's current working
+directory, not the selected YAML profile's directory or `.env`. DeepAgents uses
+provider base URLs and normal process trust variables. When
 their env vars are unset they expand to empty and inject **nothing**: no custom
 HTTP client on the SDK/OpenAI side, no environment change on the `claude`
-subprocess. The default all-`cli` profile runs with just your Claude Code login
-(and an SDK/OpenAI profile with just an API key). You only add a cert when
+subprocess. A detection-only default run uses your Claude Code login; enabled
+S10/S11 additionally use provider keys. You add a cert only when
 something in front of the endpoint demands it.
 
 **When is a certificate needed?** Only behind a private gateway or a
@@ -181,8 +201,8 @@ bundle at all** — the system trust store validates them.
 | Situation | What to set | Applies to |
 |---|---|---|
 | Public endpoint (`api.anthropic.com` / `api.openai.com`) + a normal API key | **nothing** TLS-related | all backends |
-| Private gateway / intercepting proxy whose server cert chains to an **internal root CA** | the per-backend CA bundle env var (see table below) | sdk, openai, cli |
-| Gateway requires **mutual TLS (mTLS)** | `ANTHROPIC_SDK_CLIENT_CERT` | **`via: sdk` only** |
+| Private gateway / intercepting proxy whose server cert chains to an **internal root CA** | the per-backend or generic CA bundle env var (see table below) | sdk, openai, cli, deepagents |
+| Gateway requires **mutual TLS (mTLS)** | `ANTHROPIC_SDK_CLIENT_CERT` | direct Anthropic SDK detection transport only; not Agent-SDK S10/S11 |
 | Throwaway/test env where you must skip verification (**insecure**) | `verify_ssl: false` in the backend's config block | sdk, openai, cli |
 
 Per-backend env vars / config keys:
@@ -192,12 +212,14 @@ Per-backend env vars / config keys:
 | `sdk` (Anthropic) | `ANTHROPIC_SDK_CA_CERT` | `ANTHROPIC_SDK_CLIENT_CERT` | `verify_ssl: false` in the `sdk:` block |
 | `openai` | `OPENAI_CA_CERT` | **not supported** | `verify_ssl: false` in the `openai:` block |
 | `cli` (`claude` subprocess) | `CLAUDE_CLI_CA_CERT` → `NODE_EXTRA_CA_CERTS` | **not supported** (Node exposes no env path) | `verify_ssl: false` → `NODE_TLS_REJECT_UNAUTHORIZED=0` on the subprocess |
+| `deepagents` | process trust (`SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, or `NODE_EXTRA_CA_CERTS` for OpenAI-compatible clients) | **not exposed by vvaharness** | no `verify_ssl` profile block; configure trust at the provider/process layer |
 
 Notes:
-- **mTLS is `via: sdk` only.** Neither the OpenAI backend nor the `claude` CLI
-  backend exposes a client-certificate path — the CLI backend simply has no
-  Node env var for it and emits a warning if one is configured. A gateway that
-  enforces mTLS must therefore be reached through a `via: sdk` role.
+- **mTLS is exposed only by the direct Anthropic SDK transport.** Neither the
+  OpenAI backend nor the direct `claude` CLI backend exposes a client-certificate
+  path. The Claude Agent SDK paths used by `sdk.yaml` S10/S11 also do not consume
+  `ANTHROPIC_SDK_CLIENT_CERT`; a gateway that requires it cannot serve those
+  post-scan routes through this setting.
 - The `via: cli` backend injects TLS settings into the `claude` **subprocess**
   environment: `CLAUDE_CLI_CA_CERT` becomes `NODE_EXTRA_CA_CERTS`, and
   `verify_ssl: false` becomes `NODE_TLS_REJECT_UNAUTHORIZED=0`. Auth and
@@ -222,30 +244,119 @@ Notes:
 
 ## 4. Configuration profiles
 
-`vvaharness` ships three profiles under `vvaharness/config/profiles/`:
+`vvaharness` ships four profiles under `vvaharness/config/profiles/`:
 
-- **`default.yaml`** — every role through the `claude` CLI (`via: cli`); the
-  scan stages run on a high-volume model and the `remediate` / `validate` roles
-  on a higher-tier reasoning model (exact IDs pinned per role in the profile).
-  It reuses your Claude Code login, so no
-  `ANTHROPIC_SDK_API_KEY` is needed. Used automatically when no
-  `./config.yaml` is present. The `cli` backend gives the model native
-  Read/Glob/Grep tools inside the target directory; it is the only
-  backend that *can* run Bash, but Bash is off unless you explicitly add
-  `- Bash` to a role's `allowed_tools` — for untrusted
-  targets prefer a `via: sdk` / `via: openai` profile (sandboxed
-  Read/Glob/Grep, no shell); see [`security.md`](security.md).
-- **`sdk.yaml`** — every role `via: sdk` (the Anthropic Python SDK; needs
-  `ANTHROPIC_SDK_API_KEY`). Sandboxed Read/Glob/Grep, no Bash. Its
+- **`default.yaml`** — mixed-backend layout. S1–S9 (detection) run `via: cli`
+  (the `claude` CLI subprocess) using your Claude Code login. S10 remediate and
+  S11 validate both run `via: deepagents` with `ANTHROPIC_API_KEY`. No shipped
+  profile runs the full S1–S11 pipeline on a
+  Claude Code login alone. Used automatically when no `./config.yaml` is
+  present. The `cli` backend gives the model native Read/Glob/Grep tools inside
+  the target directory; Bash is off unless you add `- Bash` to a role's
+  `allowed_tools` — for untrusted targets prefer `via: sdk` / `via: openai`
+  (sandboxed Read/Glob/Grep, no shell); see [`security.md`](security.md).
+- **`sdk.yaml`** — every configured role is spelled `via: sdk`. Detection uses
+  the Anthropic Python SDK, S10 translates `ANTHROPIC_SDK_API_KEY` into its
+  Claude Agent SDK environment, and S11 uses the same Harness but pins an
+  external `claude` executable. S11 can reuse Claude login/
+  `CLAUDE_CODE_OAUTH_TOKEN`, or standard `ANTHROPIC_API_KEY` /
+  `ANTHROPIC_AUTH_TOKEN`; the SDK-named key alone is not translated on that
+  path. A standard Anthropic credential alone can cover the profile because
+  sole-SDK detection accepts it as fallback. No route grants Bash. Its
   deepdive at `temperature: 0.4` enables s4 majority voting (`step4.runs: 3` /
   `vote_threshold: 2`).
-- **`full.yaml`** — an example multi-backend layout (Claude CLI + OpenAI + SDK
-  roles) you can copy and edit:
+- **`full.yaml`** — an example multi-backend layout you can copy and edit. A
+  complete run needs Claude CLI auth, `ANTHROPIC_SDK_API_KEY` for SDK
+  detection/S10, and `OPENAI_API_KEY` for OpenAI detection roles. Its
+  SDK-spelled S11 pins external `claude` and can reuse the same Claude login or
+  OAuth token already needed by the profile; standard Anthropic auth is an
+  alternative:
 
   ```bash
   cp vvaharness/config/profiles/full.yaml ./config.yaml
   $EDITOR ./config.yaml
   ```
+
+- **`taint.yaml`** — taint-first source→sink scanning with the callgraph engine.
+  Both `default.yaml` and `taint.yaml` enable the tree-sitter S0 callgraph in
+  rules mode. With a non-empty seed, Taint's `step1.mode: gap_fill` skips
+  agentic S1 except when all four escalation checks hold: more than 500 source
+  files, a web-api/web-app/service classification, at least 10 entry points,
+  and fewer than 5 sinks. An empty seed is falsey and takes the agentic S1
+  path. `catchall_mode: reachable_only` limits catch-all chunks to reachable files;
+  confirm/refute prompt on taint chunks in S4 (single-run, Opus — `claude-opus-4-8`); S9 appendix
+  lists files skipped as unreachable. **S10 and S11 are disabled** in this
+  profile (`step_remediate.enabled: false`, `step_validate.enabled: false`) —
+  only a Claude Code login is needed. The profile's header comment
+  (`vvaharness/config/profiles/taint.yaml:16–31`) is the canonical reference
+  until full engine documentation exists. Use:
+  `--config vvaharness/config/profiles/taint.yaml`.
+
+S0 is profile-controlled via `step0.enabled`; `default.yaml` and `taint.yaml`
+enable it, while `sdk.yaml` and `full.yaml` disable it by omission.
+
+### Optional external source/sink rule files (S0)
+
+S0 rules mode requires at least one usable generated source/sink rule file to
+produce static matches. No generated source/sink corpus or implicit heuristic
+baseline is bundled. With neither file, S0 returns an empty seed and the later
+pipeline continues. In `taint.yaml`, that empty `SeedPackage` is falsey, so
+`step1.mode: gap_fill` takes the agentic S1 path; the four-part gap-fill
+escalation predicate is evaluated only for a non-empty seed.
+
+To produce a rules-mode seed, generate external Semgrep-style source/sink files
+from licensed local corpus clones and supply them through:
+
+- `step0.sources_yaml` / `VVA_STEP0_SOURCES_YAML`
+- `step0.sinks_yaml` / `VVA_STEP0_SINKS_YAML`
+
+Those generated files are deliberately **not packaged** with vvaharness: their
+third-party provenance and licences must remain explicit. `generic.kb.yaml` is
+a different artifact used by S4's CWE confirm/refute prompt; it is not an S0
+source/sink rule pack.
+
+Build both files into an operator-owned directory. Do not write generated
+artifacts into an installed `vvaharness/` package:
+
+```bash
+mkdir -p ./vvaharness-generated-rules
+python -m vvaharness.rules.build_kb \
+  --semgrep /path/to/semgrep-rules \
+  --codeql /path/to/codeql \
+  --sources-out ./vvaharness-generated-rules/sources.generated.yaml \
+  --sinks-out ./vvaharness-generated-rules/sinks.generated.yaml
+export VVA_STEP0_SOURCES_YAML="$PWD/vvaharness-generated-rules/sources.generated.yaml"
+export VVA_STEP0_SINKS_YAML="$PWD/vvaharness-generated-rules/sinks.generated.yaml"
+```
+
+Build just one file (if you only have one corpus):
+
+```bash
+python -m vvaharness.rules.build_kb \
+  --semgrep /path/to/semgrep-rules \
+  --sources-out ./vvaharness-generated-rules/sources.generated.yaml
+```
+
+```bash
+python -m vvaharness.rules.build_kb \
+  --codeql /path/to/codeql \
+  --sinks-out ./vvaharness-generated-rules/sinks.generated.yaml
+```
+
+Verify the files exist:
+
+```bash
+ls -lh ./vvaharness-generated-rules/sources.generated.yaml \
+  ./vvaharness-generated-rules/sinks.generated.yaml
+```
+
+If you do not have corpus clones, the shipped profiles still run, but their
+rules-mode S0 result is empty and S1 continues agentically. The alternative
+spec-discovery path is `step0.callgraph_detection: llm` in your own profile
+copy; if annotation fails or yields no usable specs, it falls back to the same
+configured external YAML. See
+[vvaharness/rules/README.md](../vvaharness/rules/README.md) for the artifact
+schemas, provenance requirements, and maintainer build workflow.
 
 `vvaharness` automatically picks up a `./config.yaml` in the working directory
 (it overrides the packaged default); `--config <file>` selects an explicit one.
@@ -255,24 +366,26 @@ machine-specific overrides you don't commit.
 Key sections (full reference in [configuration.md](configuration.md)):
 
 - `models` — the `{id, via}` per role (see §5).
+- `step0` — deterministic seed enablement, mode, and external rule paths.
 - `step1` … `step8` — per-stage budgets, exclusions, and tuning knobs.
 - `step_remediate` / `step_validate` — the remediation (stage 10) and
-  validation (stage 11) stages: `enabled`, budgets, and tool allowlists. Both
-  are ON by default in the shipped profiles (`enabled: true`); set
-  `enabled: false` to opt a run out.
+  validation (stage 11) stages: `enabled`, budgets, and tool allowlists. They are
+  enabled in `default.yaml`, `sdk.yaml`, and `full.yaml`, and disabled in
+  `taint.yaml`.
 - `inject` — paths to optional context inputs (see §6).
 - `batch` — clone token / base URL / skip patterns for `--repo-file` mode.
 - `output.preserve_on_cleanup` — folders kept when a clone is purged.
 
 > **Backend limits when repointing `models.remediate` / `models.validate`.**
-> Both default to an Anthropic `via: cli` role, which works out of the box.
-> If you change them: `validate` is **Anthropic-only** — a `via: openai` validate
-> role is refused (the validate step aborts with exit code 2). `remediate` in
-> **fix mode** is also effectively Anthropic-only — applying a fix needs the
-> `Edit`/`Write` tools that only the `via: cli` / `via: sdk` backends expose, so a
-> `via: openai` remediate role can only run `--mode report-only` (it proposes
-> fixes, applies none). Detection (S1–S9) and report-only remediation run on any
-> backend. See [models.md](models.md) and [remediation.md](remediation.md).
+> By default, `models.remediate` and `models.validate` both use `via: deepagents`
+> with `ANTHROPIC_API_KEY`. If you
+> override them: a `via: openai` validate role is routed to `via: deepagents` with
+> the OpenAI provider, so it still needs `OPENAI_API_KEY` (plus `OPENAI_BASE_URL`
+> for a custom endpoint). Remediation **fix mode** requires `via: cli`, `via: sdk`, or the
+> repo-confined `via: deepagents` filesystem backend; a `via: openai` remediate
+> role can only run `--mode report-only` (proposes fixes, applies none).
+> Detection (S1–S9) and report-only remediation run on any backend. See
+> [models.md](models.md) and [remediation.md](remediation.md).
 
 > **Scanning a less-trusted or sensitive target?** vvaharness assumes an
 > authorized operator running against a trusted repository. For third-party code,
@@ -285,9 +398,14 @@ Key sections (full reference in [configuration.md](configuration.md)):
 
 | `via:` | Transport | Auth | Notes |
 |---|---|---|---|
-| `cli` | `claude` CLI subprocess | run `claude` then `/login`, or `CLAUDE_CODE_OAUTH_TOKEN` | the default profile; only backend with **Bash** |
-| `sdk` | Anthropic Python SDK | `ANTHROPIC_SDK_API_KEY` | honours `temperature`, `max_turns`; sandboxed Read/Glob/Grep; only backend with **mTLS** |
+| `cli` | `claude` CLI subprocess | run `claude` then `/login`, or `CLAUDE_CODE_OAUTH_TOKEN` | the default profile; only backend capable of **Bash**, which still must be allowlisted |
+| `sdk` | Anthropic Python SDK for detection; Claude Agent SDK for S10 fix/S11 | SDK key for detection/S10; S11 pins external `claude` and uses Claude login/OAuth or standard Anthropic auth (SDK key alone is insufficient) | detection honours `temperature`, `max_turns`; sandboxed Read/Glob/Grep; direct detection transport alone exposes **mTLS** |
 | `openai` | OpenAI-compatible API | `OPENAI_API_KEY` | any compatible endpoint via `OPENAI_BASE_URL`; sandboxed Read/Glob/Grep |
+| `deepagents` | DeepAgents/LangGraph provider harness | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` or `OPENAI_API_KEY` | S10/S11 only; S10 fix mode has repo-confined writes, S11 is read-only; Bash denied |
+
+The `cli`/`sdk` rows describe detection. S11 maps both selectors to the
+read-only Claude Agent SDK Harness; S10 remains direct CLI for `via: cli` and
+delegates fix-mode Edit/Write to the Agent SDK for `via: sdk`.
 
 Swapping is config-only — no code change:
 

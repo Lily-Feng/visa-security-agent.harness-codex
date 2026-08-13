@@ -33,11 +33,14 @@ real majority voting, point `models.deepdive` at a temperature-capable model
 node. The s5 prefilter + s6 verifier are the FP defence when voting is off.
 """
 from __future__ import annotations
+import logging
 import re
 import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 from vvaharness.models import Chunk, ChunkSize, ContextPackage, Finding, VulnClass
 from vvaharness.backends.llm import prompt, resolve
@@ -51,6 +54,7 @@ from vvaharness.util.prompts import (EXCLUSION_RULES, SELF_VERIFICATION,
                             SEVERITY_GUIDANCE, EXHAUSTIVENESS)
 from vvaharness.lang.hints import hints_for, LANG_DISPLAY
 from vvaharness.pipeline.stages.s1_preprocess import q_file, q_name
+from vvaharness.rules import CweKB
 
 _QUALITY_BAR = """\
 QUALITY BAR:
@@ -152,6 +156,12 @@ WINDOW_OVERLAP = 100
 # This caps per-line SIZE only; it does not re-window a single huge line.
 MAX_LINE_CHARS = 8000
 
+# Deprecated override: taint chunks now use models.deepdive like other chunk
+# kinds. Keep reading step4.taint_model only to emit a one-time warning so
+# legacy profiles fail soft instead of surprising users with hidden routing.
+_TAINT_MODEL_WARNED = False
+_DEF_SPANS_ABSENT_WARNED = False
+
 
 def _effective_runs(cfg) -> tuple[int, int]:
     """
@@ -163,6 +173,10 @@ def _effective_runs(cfg) -> tuple[int, int]:
     """
     runs = cfg.step4.runs
     threshold = cfg.step4.vote_threshold
+    if runs < 1:
+        print(f"  [s4] WARN: invalid runs={runs}; forcing runs=1, "
+              "vote_threshold=1.", file=sys.stderr)
+        return 1, 1
     model_id, via, extras = resolve(cfg.models.deepdive)
     if via == "cli" and runs > 1:
         print(f"  [s4] WARN: models.deepdive.via={via!r} has no temperature control; "
@@ -209,8 +223,10 @@ def run(manifest_chunks: list[Chunk], ctx: ContextPackage, cfg
 
     Returns ``(findings, outcomes)`` where ``outcomes`` maps each chunk id to
     ``"completed"`` / ``"error"`` / ``"guardrail"`` so the report can disclose
-    coverage loss (a failed/timed-out chunk yields no findings, previously
-    indistinguishable from a clean chunk that simply found nothing)."""
+    coverage loss and distinguish a failed/timed-out chunk (which yields no
+    findings) from a clean chunk that simply found nothing."""
+    log.info("s4/deepdive: starting deep-dive analysis - chunks=%d", len(manifest_chunks))
+    tracker = getattr(cfg, "_scan_progress", None)
     repo_root = Path(ctx.repo_root)
     chunks = sorted(manifest_chunks, key=lambda c: c.risk_rank)
     parallel = getattr(cfg.step4, "parallel", 1)
@@ -238,6 +254,8 @@ def run(manifest_chunks: list[Chunk], ctx: ContextPackage, cfg
         all_findings: list[Finding] = []
         for chunk in chunks:
             _label(chunk)
+            if tracker is not None:
+                tracker.scanning(chunk)
             try:
                 findings = _deepdive_chunk(chunk, ctx, repo_root, cfg,
                                            runs_n, threshold)
@@ -248,6 +266,8 @@ def run(manifest_chunks: list[Chunk], ctx: ContextPackage, cfg
                 _errlog.log("s4", f"guardrail:{chunk.id}", e, scope="chunk",
                             files=len(chunk.files))
                 outcomes[chunk.id] = "guardrail"
+                if tracker is not None:
+                    tracker.scanned(chunk, outcome="guardrail", n_findings=0)
                 if guardrail_hits >= guardrail_gate and successes == 0:
                     _guardrail_fail_fast(e)
                 continue
@@ -261,13 +281,24 @@ def run(manifest_chunks: list[Chunk], ctx: ContextPackage, cfg
                 _errlog.log("s4", chunk.id, e, scope="chunk",
                             files=len(chunk.files))
                 outcomes[chunk.id] = "error"
+                if tracker is not None:
+                    tracker.scanned(chunk, outcome="error", n_findings=0)
                 continue
             successes += 1
             outcomes[chunk.id] = "completed"
             all_findings.extend(findings)
+            if tracker is not None:
+                tracker.scanned(chunk, outcome="completed", n_findings=len(findings))
             print(f"  [s4] chunk {chunk.id}: {len(findings)} high-confidence findings",
                   file=sys.stderr)
-        return _collapse_across_chunks(all_findings, cfg.step4.line_bucket), outcomes
+        collapsed = _collapse_across_chunks(all_findings, cfg.step4.line_bucket)
+        error_count = sum(1 for v in outcomes.values() if v == "error")
+        guardrail_count = sum(1 for v in outcomes.values() if v == "guardrail")
+        log.info("s4/deepdive: serial processing complete - chunks=%d findings=%d errors=%d guardrails=%d",
+                 len(chunks), len(collapsed), error_count, guardrail_count)
+        if tracker is not None:
+            tracker.print_summary()
+        return collapsed, outcomes
 
     print(f"  [s4] processing {len(chunks)} chunks ({parallel} parallel)...",
           file=sys.stderr)
@@ -276,6 +307,8 @@ def run(manifest_chunks: list[Chunk], ctx: ContextPackage, cfg
     futs = {}
     for chunk in chunks:
         _label(chunk)
+        if tracker is not None:
+            tracker.scanning(chunk)
         futs[ex.submit(_deepdive_chunk, chunk, ctx, repo_root, cfg,
                        runs_n, threshold)] = chunk
     try:
@@ -291,6 +324,8 @@ def run(manifest_chunks: list[Chunk], ctx: ContextPackage, cfg
                             files=len(chunk.files))
                 results[chunk.id] = []
                 outcomes[chunk.id] = "guardrail"
+                if tracker is not None:
+                    tracker.scanned(chunk, outcome="guardrail", n_findings=0)
                 if guardrail_hits >= guardrail_gate and successes == 0:
                     cli.abort()
                     ex.shutdown(wait=False, cancel_futures=True)
@@ -302,10 +337,14 @@ def run(manifest_chunks: list[Chunk], ctx: ContextPackage, cfg
                             files=len(chunk.files))
                 results[chunk.id] = []
                 outcomes[chunk.id] = "error"
+                if tracker is not None:
+                    tracker.scanned(chunk, outcome="error", n_findings=0)
                 continue
             successes += 1
             results[chunk.id] = findings
             outcomes[chunk.id] = "completed"
+            if tracker is not None:
+                tracker.scanned(chunk, outcome="completed", n_findings=len(findings))
             print(f"  [s4] chunk {chunk.id}: {len(findings)} high-confidence findings",
                   file=sys.stderr)
     except KeyboardInterrupt:
@@ -322,18 +361,34 @@ def run(manifest_chunks: list[Chunk], ctx: ContextPackage, cfg
     all_findings: list[Finding] = []
     for chunk in chunks:
         all_findings.extend(results.get(chunk.id, []))
-    return _collapse_across_chunks(all_findings, cfg.step4.line_bucket), outcomes
+    collapsed = _collapse_across_chunks(all_findings, cfg.step4.line_bucket)
+    completed_count = sum(1 for v in outcomes.values() if v == "completed")
+    error_count = sum(1 for v in outcomes.values() if v == "error")
+    guardrail_count = sum(1 for v in outcomes.values() if v == "guardrail")
+    log.info("s4/deepdive: parallel processing complete - chunks=%d (completed=%d errors=%d guardrails=%d) findings=%d",
+             len(chunks), completed_count, error_count, guardrail_count, len(collapsed))
+    if tracker is not None:
+        tracker.print_summary()
+    return collapsed, outcomes
 
 
 def _deepdive_chunk(chunk: Chunk, ctx: ContextPackage, repo_root: Path, cfg,
                     runs_n: int, threshold: int) -> list[Finding]:
-    code = _load_chunk_code(chunk, repo_root)
+    code = _load_chunk_code(chunk, ctx, repo_root, cfg)
     code += _neighbor_context(chunk, ctx, repo_root, cfg)
     if chunk.specialist:
         # Specialist passes are a different LENS, not a consistency probe.
         # Run once; s6 adversarial verification is the FP filter.
-        runs_n = getattr(cfg.step4, "specialist_runs", 1)
+        runs_n = max(1, int(getattr(cfg.step4, "specialist_runs", 1) or 1))
         threshold = 1
+    elif chunk.path_funcs:
+        # Taint chunks under taint.yaml: confirm/refute is single-shot — voting
+        # adds no signal when the question is binary. Under default.yaml
+        # taint_runs is unset → falls through to the global runs_n.
+        tr = getattr(cfg.step4, "taint_runs", None)
+        if tr:
+            runs_n = max(1, int(tr))
+            threshold = min(threshold, runs_n) or 1
     line_bucket = cfg.step4.line_bucket
 
     # ── N independent runs ───────────────────────────────────────────────
@@ -407,12 +462,27 @@ def _collapse_across_chunks(findings: list[Finding], line_bucket: int) -> list[F
 
 
 def _single_run(chunk: Chunk, ctx: ContextPackage, code: str, cfg) -> list[Finding]:
-    user = _build_prompt(chunk, ctx, code)
+    # Taint chunks under taint.yaml: confirm/refute the seeded source→sink
+    # instead of open-ended discovery, optionally on a cheaper model. Any
+    # other chunk kind (and default.yaml's taint_prompt_mode=discover) keeps
+    # the legacy prompt + model verbatim.
+    global _TAINT_MODEL_WARNED
+    model = cfg.models.deepdive
+    if (chunk.path_funcs
+            and str(getattr(cfg.step4, "taint_prompt_mode", "discover")
+                    ).lower() == "confirm_refute"):
+        user = _build_confirm_refute_prompt(chunk, ctx, code, cfg)
+        if getattr(cfg.step4, "taint_model", None) is not None and not _TAINT_MODEL_WARNED:
+            _TAINT_MODEL_WARNED = True
+            print("  [s4] WARN: step4.taint_model is deprecated and ignored; "
+                  "taint chunks now use models.deepdive.", file=sys.stderr)
+    else:
+        user = _build_prompt(chunk, ctx, code)
 
     try:
         raw = prompt(
             user,
-            model=cfg.models.deepdive,
+            model=model,
             system_prompt=SYSTEM,
             max_tokens=getattr(cfg.step4, "max_tokens", None),
             timeout=getattr(cfg.step4, "timeout", 1800),
@@ -514,6 +584,305 @@ SOURCE CODE:
 Analyze this code and respond with ONLY the JSON findings object."""
 
 
+def _norm_rel_path(path: str) -> str:
+    norm = (path or "").strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def _parse_ref_file_line(ref: str) -> tuple[str, int | None]:
+    raw = (ref or "").strip()
+    if not raw:
+        return "", None
+    f, sep, _tail = raw.partition("::")
+    if sep:
+        return _norm_rel_path(f), None
+    f, sep, ln = raw.rpartition(":")
+    if sep and f and ln.isdigit():
+        return _norm_rel_path(f), max(1, int(ln))
+    return _norm_rel_path(raw), None
+
+
+def _short_symbol(symbol: str, limit: int = 64) -> str:
+    s = (symbol or "").strip()
+    if not s:
+        return "(unknown)"
+    if len(s) <= limit:
+        return s
+    return s[:limit - 1] + "…"
+
+
+def _compact_taint_evidence_block(chunk: Chunk, ctx: ContextPackage) -> str:
+    """Render a bounded, single-path taint-evidence summary for s4 prompts.
+
+    Returns an empty string when no structured evidence can be matched, keeping
+    prompt bytes unchanged for non-evidence chunks.
+    """
+    evidence_paths = getattr(ctx, "seed_taint_evidence", None) or []
+    if not evidence_paths:
+        return ""
+
+    src_file, _src_line = _parse_ref_file_line(chunk.source_ref)
+    sink_file, sink_line = _parse_ref_file_line(chunk.sink_ref)
+    chunk_path = set(chunk.path_funcs or [])
+
+    best = None
+    best_score = 0
+    for ev in evidence_paths:
+        edges = list(getattr(ev, "edges", None) or [])
+        if not edges:
+            continue
+        ev_src_file, _ev_src_line = _parse_ref_file_line(getattr(ev, "source_ref", ""))
+        ev_sink_file, ev_sink_line = _parse_ref_file_line(getattr(ev, "sink_ref", ""))
+        score = 0
+        if src_file and ev_src_file and src_file == ev_src_file:
+            score += 3
+        if sink_file and ev_sink_file and sink_file == ev_sink_file:
+            score += 3
+        if sink_line is not None and ev_sink_line is not None and sink_line == ev_sink_line:
+            score += 2
+        if chunk_path and getattr(ev, "path_funcs", None):
+            overlap = len(chunk_path & set(ev.path_funcs or []))
+            if overlap:
+                score += min(3, overlap)
+        if score > best_score:
+            best = ev
+            best_score = score
+
+    if best is None:
+        return ""
+
+    edges = list(getattr(best, "edges", None) or [])
+    key_kinds = (
+        "assign",
+        "arg_to_param",
+        "return_to_local",
+        "local_to_sink",
+        "return_to_sink",
+    )
+    transfer_counts = Counter(
+        getattr(edge, "transfer_kind", "") for edge in edges
+        if getattr(edge, "transfer_kind", "") in key_kinds
+    )
+    if not transfer_counts:
+        return ""
+
+    source_edge = next((e for e in edges if getattr(e, "transfer_kind", "") == "source"), edges[0])
+    sink_edge = next(
+        (e for e in reversed(edges)
+         if getattr(e, "transfer_kind", "") in {"local_to_sink", "return_to_sink"}),
+        edges[-1],
+    )
+
+    transfer_summary = ", ".join(
+        f"{k}:{transfer_counts[k]}" for k in key_kinds if transfer_counts.get(k)
+    )
+    sink_sym = _short_symbol(getattr(getattr(sink_edge, "dst", None), "symbol", ""))
+    if sink_sym == "(unknown)":
+        sink_sym = _short_symbol(getattr(getattr(sink_edge, "src", None), "symbol", ""))
+
+    # Build optional extra lines for field/container/sanitize edges.
+    # Priority: sanitized (highest signal) → field flow → container flow.
+    extra_lines: list[str] = []
+    sanitize_edges = [e for e in edges if getattr(e, "transfer_kind", "") == "sanitize"]
+    if sanitize_edges:
+        san_e = sanitize_edges[0]
+        san_sym = q_name(san_e.function_qnode) or _short_symbol(
+            getattr(getattr(san_e, "dst", None), "symbol", "")
+        )
+        extra_lines.append(f"  SANITIZED via              : {san_sym}")
+    field_edges = [e for e in edges
+                   if getattr(e, "transfer_kind", "") in {"field_write", "field_read"}]
+    if field_edges:
+        fw = sum(1 for e in field_edges if getattr(e, "transfer_kind", "") == "field_write")
+        fr = sum(1 for e in field_edges if getattr(e, "transfer_kind", "") == "field_read")
+        parts = ([f"field_write:{fw}"] if fw else []) + ([f"field_read:{fr}"] if fr else [])
+        extra_lines.append(f"  FIELD FLOW                 : {', '.join(parts)}")
+    container_edges = [e for e in edges
+                       if getattr(e, "transfer_kind", "") in {"container_put", "container_get"}]
+    if container_edges:
+        cp = sum(1 for e in container_edges if getattr(e, "transfer_kind", "") == "container_put")
+        cg = sum(1 for e in container_edges if getattr(e, "transfer_kind", "") == "container_get")
+        parts = ([f"container_put:{cp}"] if cp else []) + ([f"container_get:{cg}"] if cg else [])
+        extra_lines.append(f"  CONTAINER FLOW             : {', '.join(parts)}")
+    # Condition edges — taint transfer gated by a (possibly tainted) condition.
+    condition_edges = [e for e in edges if getattr(e, "transfer_kind", "") == "condition"]
+    if condition_edges:
+        cond_e = condition_edges[0]
+        cond_text = getattr(cond_e, "condition_text", "") or "(unknown)"
+        cond_conf = getattr(cond_e, "confidence", "high")
+        extra_lines.append(f"  CONDITION GATE             : [{cond_text}] (confidence: {cond_conf})")
+    # Reflection edges — speculative taint transfer via dynamic dispatch.
+    reflect_edges = [e for e in edges if getattr(e, "transfer_kind", "") == "reflect"]
+    if reflect_edges:
+        ref_e = reflect_edges[0]
+        call_type = getattr(ref_e, "call_type", "reflect")
+        ref_conf = getattr(ref_e, "confidence", "medium")
+        targets = list(getattr(ref_e, "reflected_targets", []) or [])
+        if targets:
+            first = _short_symbol(targets[0])
+            if len(targets) >= 2:
+                second = _short_symbol(targets[1])
+                remaining = len(targets) - 2
+                targets_str = (
+                    f"{first}, {second}" + (f" +{remaining} more" if remaining > 0 else "")
+                )
+            else:
+                targets_str = first
+            extra_lines.append(
+                f"  REFLECT EDGE               : [{call_type}] → {targets_str}"
+                f" (confidence: {ref_conf}, speculative)"
+            )
+        else:
+            extra_lines.append(
+                f"  REFLECT EDGE               : [{call_type}]"
+                f" (confidence: {ref_conf}, speculative)"
+            )
+    # Framework edges — taint via framework-level source injection.
+    framework_edges = [e for e in edges if getattr(e, "transfer_kind", "") == "framework"]
+    if framework_edges:
+        fw_e = framework_edges[0]
+        framework = getattr(fw_e, "framework", "framework")
+        marker_name = getattr(fw_e, "marker_type", "marker")
+        fw_conf = getattr(fw_e, "confidence", "high")
+        extra_lines.append(
+            f"  FRAMEWORK SOURCE           : [{framework}] {marker_name}"
+            f" (confidence: {fw_conf})"
+        )
+    # Response dataflow — taint flows to response sink.
+    # Common response sink patterns across frameworks (Spring, Django, ASP.NET, etc.).
+    response_sink_patterns = {
+        "JsonResponse", "ResponseEntity", "Ok", "Created", "BadRequest", "Conflict",
+        "Response", "HttpResponse", "JsonResult", "ViewResult", "ContentResult",
+        "DirectResult", "StatusCodeResult", "ObjectResult", "ApiResponse",
+        "render", "json", "jsonify", "dumps", "to_json",
+        "HttpServletResponse", "ServletResponse", "PrintWriter", "OutputStream",
+    }
+    to_sink = getattr(getattr(sink_edge, "dst", None), "symbol", "")
+    sink_sym_for_response = _short_symbol(to_sink)
+    if sink_sym_for_response in response_sink_patterns:
+        response_type = "json"  # default
+        if any(p in sink_sym_for_response.lower() for p in {"html", "render", "template"}):
+            response_type = "html"
+        elif any(p in sink_sym_for_response.lower() for p in {"json", "jsonify", "to_json"}):
+            response_type = "json"
+        elif any(p in sink_sym_for_response.lower() for p in {"xml"}):
+            response_type = "xml"
+        else:
+            response_type = "text"
+        extra_lines.append(
+            f"  RESPONSE OUTPUT            : {sink_sym_for_response}"
+            f" (type: {response_type})"
+        )
+    # Enforce max 9 total content lines (3 base + 6 extras):
+    # Sanitize, field, container (up to 3); condition + reflect (up to 2); framework + response (up to 2).
+    extra_lines = extra_lines[:6]
+
+    extra_block = "".join(line + "\n" for line in extra_lines)
+
+    # Annotation notes embedded in the prompt to guide model reasoning.
+    # These are not counted against the line cap.
+    annotation_lines: list[str] = []
+    if condition_edges:
+        cond_text = getattr(condition_edges[0], "condition_text", "") or "(unknown)"
+        annotation_lines.append(
+            f"  NOTE: Path is gated by condition: {cond_text}."
+            " If condition is false, taint is neutralized."
+        )
+    if reflect_edges:
+        targets = list(getattr(reflect_edges[0], "reflected_targets", []) or [])
+        target_str = _short_symbol(targets[0]) if targets else "(unresolved)"
+        annotation_lines.append(
+            f"  NOTE: Path involves reflection to {target_str}."
+            " This is a speculative path based on static analysis."
+        )
+    # Annotation notes for framework sources and response flows.
+    if framework_edges:
+        fw_framework = getattr(framework_edges[0], "framework", "framework")
+        annotation_lines.append(
+            f"  NOTE: Source is framework-injected ({fw_framework})."
+            " Parameters are automatically tainted via framework binding."
+        )
+    if (getattr(getattr(sink_edge, "dst", None), "symbol", "") in response_sink_patterns or
+        _short_symbol(getattr(getattr(sink_edge, "dst", None), "symbol", "")) in response_sink_patterns):
+        annotation_lines.append(
+            f"  NOTE: Output flows to response object. Risk: XSS if data not escaped,"
+            f" or injection if response type is HTML/XML/JSON."
+        )
+    annotation_block = "".join(line + "\n" for line in annotation_lines)
+
+    return (
+        "\nSTRUCTURED TAINT EVIDENCE (compact)\n"
+        f"  origin tainted symbol : {_short_symbol(getattr(source_edge.src, 'symbol', ''))}\n"
+        f"  transfer edges kinds  : {transfer_summary}\n"
+        f"  sink-consuming symbol : {sink_sym}\n"
+        + extra_block
+        + annotation_block
+    )
+
+
+def _build_confirm_refute_prompt(chunk: Chunk, ctx: ContextPackage,
+                                 code: str, cfg=None) -> str:
+    """Taint-first (taint.yaml) prompt for chunks with ``path_funcs``.
+
+    The s0 static seed already named a concrete source, sink and (often) CWE.
+    The model's job is verification, not discovery: trace the path hop-by-hop
+    and either CONFIRM (emit one finding with the unsanitised hop as evidence)
+    or REFUTE (emit zero findings, naming the sanitiser). Same JSON schema as
+    the open-ended prompt so the existing parse path is unchanged."""
+    src_file, _, src_fn = chunk.source_ref.rpartition("::")
+    cwe = ", ".join(chunk.sink_cwe) if chunk.sink_cwe else "(infer from sink)"
+    hops = " -> ".join(q_name(n) for n in chunk.path_funcs) or "(direct)"
+    # Per-CWE sanitizer / non-sanitizer / FP-check guidance from rules/*.kb.yaml.
+    # Empty string when the CWE is unknown → prompt is byte-identical to the
+    # pre-KB shape, so default.yaml and unmapped sinks are unaffected.
+    rules_cfg = getattr(cfg, "rules", None) if cfg is not None else None
+    kb_overlays = getattr(rules_cfg, "kb_overlays", None)
+    kb_block = CweKB.load(overlays=kb_overlays).prompt_block(
+        chunk.sink_cwe, lang=(chunk.languages[0] if chunk.languages else None))
+    evidence_block = _compact_taint_evidence_block(chunk, ctx)
+    return f"""TASK: confirm or refute ONE candidate taint path. Do NOT hunt for
+unrelated issues — that is covered by other chunks.
+
+CANDIDATE PATH
+  source : {src_fn or chunk.source_ref}()  [{src_file or chunk.source_ref}]
+  sink   : {chunk.sink_ref}
+  hops   : {hops}
+    class  : {cwe}{evidence_block}
+{kb_block}
+The SOURCE CODE below contains ONLY the functions on this path (plus a few
+context lines and out-of-chunk neighbor excerpts). Line numbers are real file
+positions — cite them exactly.
+{_trust_context_block(ctx)}
+DECISION RULES
+  • CONFIRMED  — attacker-controlled data from the source reaches the sink
+    without an effective sanitiser/validator/allow-list on the path. Emit
+    EXACTLY ONE finding. `source_ref` MUST cite the source line, `sink_ref`
+    MUST cite the sink line, and `description` MUST name the first hop where
+    sanitisation was missing.
+  • Framework sources (with FRAMEWORK SOURCE marker): Source is framework-injected
+    (Spring @RequestParam, Django request.GET, ASP.NET model binding, etc.).
+    Parameters are automatically tainted and must be validated downstream
+    before reaching a sink.
+  • Response flows (with RESPONSE OUTPUT marker): Output flows to a response
+    object (JSON, HTML, XML, plain text). Risk: XSS if data not escaped,
+    or response-format injection if type not properly handled.
+  • REFUTED    — a sanitiser/validator/type-coercion neutralises the input
+    before it reaches the sink, OR the path is not actually connected in the
+    code shown. Emit ZERO findings. In the JSON, set
+    `findings: []` and add `refuted_reason: "<file:line> — <one-line why>"`.
+    • If you cannot decide from the code shown, emit `findings: []` with
+        `refuted_reason: "insufficient evidence in provided slice"`.
+        Do NOT claim a sanitizer/control unless you can cite it in the shown code.
+
+SOURCE CODE:
+{code}
+
+Respond with ONLY the JSON object (`findings` array, optional
+`refuted_reason`)."""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Code loading (same as SDK version — CLI single-shot needs code in the prompt)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -594,10 +963,301 @@ def _redact_source(text: str, rel: str) -> str:
     return masked
 
 
-def _load_chunk_code(chunk: Chunk, repo_root: Path) -> str:
+def _load_chunk_code(chunk: Chunk, ctx: ContextPackage, repo_root: Path,
+                     cfg) -> str:
+    global _DEF_SPANS_ABSENT_WARNED
+    slice_mode = _slice_mode(cfg)
+    if slice_mode == "function" and not (ctx.def_spans or {}):
+        if not _DEF_SPANS_ABSENT_WARNED:
+            print("  [s4] WARN: def_spans absent — function-level slicing unavailable; "
+                  "using whole-file fallback mode.",
+                  file=sys.stderr)
+            _DEF_SPANS_ABSENT_WARNED = True
+    # Taint-first profile: ship only the function bodies on the BFS path, not
+    # whole files. Gated on (a) the chunk actually having path metadata,
+    # (b) tree-sitter having produced def_spans, and (c) the profile opting in
+    # — so default.yaml is byte-identical.
+    if chunk.path_funcs and slice_mode == "function":
+        sliced = _load_taint_slice(chunk, ctx, repo_root)
+        if sliced:
+            return sliced
+    # AST/callgraph-first slice for general risk/specialist chunks too.
+    if slice_mode == "function":
+        sliced = _load_graph_slice(chunk, ctx, repo_root, cfg)
+        if sliced:
+            return sliced
     if chunk.size != ChunkSize.LARGE:
         return _load_files_full(chunk.files, repo_root)
-    return _load_sliding_window(chunk, repo_root)
+    return _load_sliding_window(chunk, repo_root, ctx=ctx)
+
+
+def _slice_mode(cfg) -> str:
+    """Resolve chunk slicing mode for S4.
+
+    The shipped key is ``step3.taint_chunk_slice`` (declared in the defaults
+    layer and set by ``profiles/taint.yaml``). An optional
+    ``step4.taint_chunk_slice`` overrides it when explicitly present, but no
+    shipped profile sets it, so ``step3`` is the effective key in practice.
+    Defaults to ``file``.
+    """
+    s4 = getattr(cfg, "step4", None)
+    mode = getattr(s4, "taint_chunk_slice", None)
+    if mode is None:
+        mode = getattr(getattr(cfg, "step3", None), "taint_chunk_slice", "file")
+    return str(mode or "file").lower()
+
+
+def _load_graph_slice(chunk: Chunk, ctx: ContextPackage,
+                      repo_root: Path, cfg, pad: int = 6) -> str:
+    """Render a graph/AST-prioritized code slice for non-taint chunks.
+
+    Picks function spans in chunk files using call-graph and focus anchors.
+    Any chunk file the graph cannot resolve a span for — or whose functions
+    exceed the per-file cap — is shipped WHOLE (per-file fallback), never
+    truncated to a fixed head, so coverage is preserved.
+    """
+    spans = ctx.def_spans or {}
+    files_locs = ctx.call_graph_files or {}
+
+    max_funcs_per_file = int(getattr(cfg.step4, "frontier_max_funcs_per_file", 24) or 24)
+    chunk_files = set(chunk.files)
+    focus = set(chunk.focus_entry_points or ())
+
+    # Rank qnodes by threat relevance: explicit path hops and focus anchors first,
+    # then caller/callee connectivity, then deterministic lexical tie-break.
+    scores: dict[str, int] = defaultdict(int)
+    for qn in dict.fromkeys(chunk.path_funcs or []):
+        if q_file(qn) in chunk_files:
+            scores[qn] += 100
+    # Index qnodes by (file, name) once so entry-point and sink attribution are
+    # direct lookups instead of a full scan of ``spans`` per anchor.
+    qns_by_file_name: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for qn in spans:
+        qns_by_file_name[(q_file(qn), q_name(qn))].append(qn)
+    for ep in ctx.entry_points:
+        if ep.file in chunk_files and ep.function:
+            for qn in qns_by_file_name.get((ep.file, ep.function), ()):
+                scores[qn] += 50
+    for sink in ctx.unsafe_sinks:
+        if sink.file in chunk_files and sink.function:
+            for qn in qns_by_file_name.get((sink.file, sink.function), ()):
+                scores[qn] += 45
+    for caller, callees in (ctx.call_graph or {}).items():
+        if q_file(caller) in chunk_files:
+            scores[caller] += 10
+        for callee in callees or ():
+            if q_file(callee) in chunk_files:
+                scores[callee] += 8
+            if q_file(caller) in chunk_files and q_file(callee) in chunk_files:
+                scores[caller] += 3
+                scores[callee] += 3
+    for qn in spans:
+        if q_file(qn) in chunk_files and q_name(qn) in focus:
+            scores[qn] += 40
+
+    ranked = sorted(
+        (qn for qn in spans if q_file(qn) in chunk_files),
+        key=lambda qn: (-scores.get(qn, 0), q_file(qn), q_name(qn)),
+    )
+
+    by_file: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    picked_per_file: dict[str, int] = defaultdict(int)
+    clipped_files: set[str] = set()
+    for qn in ranked:
+        f = q_file(qn)
+        if picked_per_file[f] >= max_funcs_per_file:
+            # More resolved functions than the per-file cap: record the file so
+            # the emit loop ships it WHOLE rather than dropping the functions
+            # past the cap.
+            clipped_files.add(f)
+            continue
+        sp = spans.get(qn)
+        if not sp or len(sp) < 2:
+            continue
+        lo, hi = int(sp[0]), int(sp[1])
+        if lo <= 0 or hi <= lo:
+            continue
+        by_file[f].append((max(1, lo - pad), hi + pad))
+        picked_per_file[f] += 1
+
+    # Focus anchors from call_graph_files: for specialist shards, this can
+    # provide usable ranges even when no retained def_spans qnode hits a file.
+    for fn in focus:
+        for ref in files_locs.get(fn, ()):
+            rf, sep, rl = ref.rpartition(":")
+            if not sep or not rl.isdigit() or rf not in chunk_files:
+                continue
+            ln = int(rl)
+            by_file[rf].append((max(1, ln - pad), ln + pad))
+
+    # Include explicit sink line for module-scope sink calls.
+    if chunk.sink_ref:
+        sf, _, sl = chunk.sink_ref.rpartition(":")
+        if sf and sl.isdigit() and sf in chunk_files:
+            ln = int(sl)
+            by_file[sf].append((max(1, ln - pad), ln + pad))
+
+    # No span/anchor ranges resolved for this chunk: force caller fallback to
+    # per-file loading instead of emitting tiny file-head snippets.
+    if not by_file:
+        return ""
+
+    parts: list[str] = []
+    n_lines = 0
+    whole_file_fallbacks: list[str] = []
+    for rel in chunk.files:
+        p = repo_root / rel
+        if not p.is_file():
+            parts.append(f"=== {rel} ===\n[FILE NOT FOUND]\n")
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            parts.append(f"=== {rel} ===\n[READ ERROR: {e}]\n")
+            continue
+        lines = [ln[:MAX_LINE_CHARS] for ln in _redact_source(text, rel).splitlines()]
+        ranges = by_file.get(rel, [])
+        merged = _merge_ranges(ranges, gap=pad) if ranges else []
+        # A chunk file the call graph resolved no span for, or one whose
+        # resolved functions were clipped at ``max_funcs_per_file``, is shipped
+        # WHOLE so no code below a fixed head is dropped and the profile's
+        # "falls back to file" guarantee holds.
+        if not merged or rel in clipped_files:
+            merged = [(1, len(lines))] if lines else []
+            if lines:
+                whole_file_fallbacks.append(rel)
+        for lo, hi in merged:
+            hi = min(hi, len(lines))
+            if lo > hi:
+                continue
+            body = "\n".join(f"{i:5d}| {lines[i-1]}" for i in range(lo, hi + 1))
+            parts.append(f"=== {rel} [lines {lo}-{hi}] ===\n{body}\n")
+            n_lines += hi - lo + 1
+    if not parts:
+        return ""
+    if whole_file_fallbacks:
+        shown = ", ".join(whole_file_fallbacks[:5])
+        more = (f" (+{len(whole_file_fallbacks) - 5} more)"
+                if len(whole_file_fallbacks) > 5 else "")
+        print(f"    [s4] {chunk.id}: shipped {len(whole_file_fallbacks)} "
+              f"un-graphed/clipped file(s) whole to preserve coverage: "
+              f"{shown}{more}", file=sys.stderr)
+    print(f"    [s4] {chunk.id}: graph-slice {n_lines} lines "
+          f"(files={len(chunk.files)}, spans={sum(len(v) for v in by_file.values())})",
+          file=sys.stderr)
+    return "\n".join(parts)
+
+
+def _load_taint_slice(chunk: Chunk, ctx: ContextPackage,
+                      repo_root: Path, pad: int = 8) -> str:
+    """Render only the def-span of each qnode on ``chunk.path_funcs`` (plus
+    ``pad`` context lines either side, plus the sink line itself). Per-file
+    overlapping ranges are merged so a 5-hop path through one large class
+    emits one contiguous block, not five overlapping ones.
+
+    Returns ``""`` when no path qnode resolves to a span — caller falls back
+    to whole-file loading so a missing tree-sitter install never drops code.
+    """
+    spans = ctx.def_spans or {}
+    if not spans:
+        return ""
+    files_locs = ctx.call_graph_files or {}
+    # qnode → (file, lo, hi); fall back to def-line ±pad when no AST span.
+    by_file: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    whole_file: set[str] = set()
+    n_ast = n_anchor = n_whole = 0
+    for qn in dict.fromkeys(chunk.path_funcs):
+        f = q_file(qn)
+        if not f:
+            continue
+        sp = spans.get(qn)
+        if sp:
+            lo, hi = sp[0], sp[1]
+            n_ast += 1
+        else:
+            # No AST span (regex-fallback file or unmapped lang) — anchor on
+            # the def line from call_graph_files and pad generously.
+            anchor = 0
+            for ref in files_locs.get(q_name(qn), ()):
+                rf, _, rl = ref.rpartition(":")
+                if rf == f and rl.isdigit():
+                    anchor = int(rl)
+                    break
+            if not anchor:
+                # Neither an AST span nor a def-line anchor resolved for this
+                # hop. Load THIS hop's file whole: the confirm/refute prompt
+                # tells the model the slice contains the whole path, so a hop
+                # must not be dropped from it.
+                whole_file.add(f)
+                n_whole += 1
+                continue
+            lo = hi = anchor
+            n_anchor += 1
+        by_file[f].append((max(1, lo - pad), hi + pad))
+    # Always include the sink line even if its enclosing def wasn't on the
+    # path (e.g. the sink is a bare call at module scope).
+    if chunk.sink_ref:
+        sf, _, sl = chunk.sink_ref.rpartition(":")
+        if sf and sl.isdigit():
+            ln = int(sl)
+            by_file[sf].append((max(1, ln - pad), ln + pad))
+    if not by_file and not whole_file:
+        return ""
+
+    parts: list[str] = []
+    n_lines = 0
+    for rel in chunk.files:       # preserve s3's file ordering (entry → sink)
+        ranges = by_file.get(rel)
+        if not ranges and rel not in whole_file:
+            continue
+        p = repo_root / rel
+        if not p.is_file():
+            parts.append(f"=== {rel} ===\n[FILE NOT FOUND]\n")
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            parts.append(f"=== {rel} ===\n[READ ERROR: {e}]\n")
+            continue
+        lines = [ln[:MAX_LINE_CHARS]
+                 for ln in _redact_source(text, rel).splitlines()]
+        if rel in whole_file:
+            emit_ranges = [(1, len(lines))] if lines else []
+        else:
+            emit_ranges = _merge_ranges(ranges, gap=pad)
+        for lo, hi in emit_ranges:
+            hi = min(hi, len(lines))
+            if lo > hi:
+                continue
+            body = "\n".join(f"{i:5d}| {lines[i-1]}" for i in range(lo, hi + 1))
+            parts.append(f"=== {rel} [lines {lo}-{hi}] ===\n{body}\n")
+            n_lines += hi - lo + 1
+    if not parts:
+        return ""
+    print(f"    [s4] {chunk.id}: function-slice {n_lines} lines "
+          f"({n_ast} AST spans, {n_anchor} anchor-only, {n_whole} whole-file) "
+          f"vs {sum(_count_lines(repo_root / f) for f in chunk.files)} "
+          f"whole-file", file=sys.stderr)
+    return "\n".join(parts)
+
+
+def _merge_ranges(ranges: list[tuple[int, int]],
+                  gap: int = 0) -> list[tuple[int, int]]:
+    """Merge overlapping / near-adjacent (≤gap apart) line ranges."""
+    out: list[tuple[int, int]] = []
+    for lo, hi in sorted(ranges):
+        if out and lo <= out[-1][1] + gap + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def _count_lines(p: Path) -> int:
+    try:
+        return sum(1 for _ in p.open("r", encoding="utf-8", errors="replace"))
+    except OSError:
+        return 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -628,6 +1288,15 @@ def _neighbor_context(chunk: Chunk, ctx: ContextPackage, repo_root: Path,
             f, _, ln = loc.rpartition(":")
             def_line[(f or loc, fn)] = int(ln) if ln.isdigit() else 0
 
+    # qnode → AST start line (preferred over heuristic fn text scans).
+    qn_line: dict[str, int] = {}
+    for qn, sp in (ctx.def_spans or {}).items():
+        if isinstance(sp, (list, tuple)) and sp:
+            try:
+                qn_line[qn] = int(sp[0])
+            except Exception:  # noqa: BLE001
+                continue
+
     in_chunk_qns = {qn for qn in set(fwd) | set(rev)
                     if q_file(qn) in chunk_files}
     focus = set(chunk.focus_entry_points or ())
@@ -652,7 +1321,7 @@ def _neighbor_context(chunk: Chunk, ctx: ContextPackage, repo_root: Path,
         nname = q_name(neighbor_qn)
         if not nfile or nfile in chunk_files:
             continue
-        nline = def_line.get((nfile, nname), 0)
+        nline = qn_line.get(neighbor_qn) or def_line.get((nfile, nname), 0)
         excerpt, lo = _excerpt(repo_root / nfile, nname, nline, n_lines)
         if excerpt is None or (nfile, lo) in seen:
             continue
@@ -709,7 +1378,8 @@ def _load_files_full(files: list[str], repo_root: Path) -> str:
     return "\n".join(parts)
 
 
-def _load_sliding_window(chunk: Chunk, repo_root: Path) -> str:
+def _load_sliding_window(chunk: Chunk, repo_root: Path,
+                         ctx: ContextPackage | None = None) -> str:
     parts = []
     for rel in chunk.files:
         p = repo_root / rel
@@ -727,7 +1397,12 @@ def _load_sliding_window(chunk: Chunk, repo_root: Path) -> str:
             parts.append(f"=== {rel} ===\n[READ ERROR: {e}]\n")
             continue
         lines = [ln[:MAX_LINE_CHARS] for ln in _redact_source(text, rel).splitlines()]
-        windows = _windows_for_entrypoints(lines, chunk.focus_entry_points)
+        anchors: list[int] = []
+        if ctx is not None:
+            anchors = _graph_anchor_lines_for_file(chunk, ctx, rel)
+        windows = _windows_for_anchors(lines, anchors)
+        if not windows:
+            windows = _windows_for_entrypoints(lines, chunk.focus_entry_points)
         if not windows:
             # No entry-point anchors → tile the entire file so nothing is skipped.
             step = WINDOW_LINES - WINDOW_OVERLAP
@@ -761,3 +1436,82 @@ def _windows_for_entrypoints(lines: list[str], entry_fns: list[str]) -> list[tup
         else:
             merged.append((lo, hi))
     return merged
+
+
+def _windows_for_anchors(lines: list[str], anchors: list[int]) -> list[tuple[int, int]]:
+    """Window builder from exact 1-based line anchors."""
+    if not anchors:
+        return []
+    half = WINDOW_LINES // 2
+    norm = sorted({a for a in anchors if 1 <= a <= len(lines)})
+    if not norm:
+        return []
+    raw = [(max(0, a - 1 - half), min(len(lines), a - 1 + half)) for a in norm]
+    merged = [raw[0]]
+    for lo, hi in raw[1:]:
+        plo, phi = merged[-1]
+        if lo <= phi + WINDOW_OVERLAP:
+            merged[-1] = (plo, max(phi, hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _graph_anchor_lines_for_file(chunk: Chunk, ctx: ContextPackage,
+                                 rel: str) -> list[int]:
+    """Collect graph/AST anchor lines for one file.
+
+    Priority sources: path qnodes, def_spans for focus entry points/sinks,
+    call-graph def-site lines, and explicit sink_ref.
+    """
+    out: list[int] = []
+    spans = ctx.def_spans or {}
+
+    def _add(n: int) -> None:
+        if n > 0 and n not in out:
+            out.append(n)
+
+    for qn in dict.fromkeys(chunk.path_funcs or []):
+        if q_file(qn) != rel:
+            continue
+        sp = spans.get(qn)
+        if sp and len(sp) >= 1:
+            _add(int(sp[0]))
+
+    focus = set(chunk.focus_entry_points or ())
+    for qn, sp in spans.items():
+        if q_file(qn) != rel or not sp:
+            continue
+        bare = q_name(qn)
+        if bare in focus:
+            _add(int(sp[0]))
+
+    for ep in ctx.entry_points:
+        if ep.file == rel:
+            for qn, sp in spans.items():
+                if q_file(qn) == rel and q_name(qn) == ep.function and sp:
+                    _add(int(sp[0]))
+                    break
+
+    for sink in ctx.unsafe_sinks:
+        if sink.file == rel:
+            _add(int(getattr(sink, "line", 0) or 0))
+            for qn, sp in spans.items():
+                if q_file(qn) == rel and q_name(qn) == sink.function and sp:
+                    _add(int(sp[0]))
+                    break
+
+    if chunk.sink_ref:
+        sf, _, sl = chunk.sink_ref.rpartition(":")
+        if sf == rel and sl.isdigit():
+            _add(int(sl))
+
+    # def-site hints for focus functions when AST span is unavailable.
+    if focus:
+        for fn in focus:
+            for loc in (ctx.call_graph_files or {}).get(fn, ()):
+                lf, _, ln = loc.rpartition(":")
+                if lf == rel and ln.isdigit():
+                    _add(int(ln))
+
+    return out

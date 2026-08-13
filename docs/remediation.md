@@ -25,7 +25,7 @@ pipeline see [architecture.md](architecture.md); for the model role see
 
 `vvaharness remediate` reads a prior scan's findings from
 `<repo>/security-scan/`, walks the verified findings one-by-one on the
-`models.remediate` role (LLM skill; ~46-line system prompt in
+`models.remediate` role (LLM skill; system prompt in
 `vvaharness/remediation_agent/prompts.py`), and proposes a
 **minimal fix per finding**. For each finding it writes a per-finding DTO:
 
@@ -37,10 +37,12 @@ pipeline see [architecture.md](architecture.md); for the model role see
 
 These DTOs are exactly what [`validate`](validation.md) (step 11) later grades.
 
-> ⚠️ **Default-on and runs in fix mode.** With the shipped `default.yaml`
+> ⚠️ **Default-on in the main profile and runs in fix mode.** With the shipped `default.yaml`
 > (`step_remediate.enabled: true`), a plain `vvaharness scan` runs the
 > Remediation Agent as **Step 10** at the end of the scan, and the in-scan path
-> forces **fix mode — it edits source files in the target repo.** To scan
+> forces **fix mode**. When verified findings, credentials, and a successful
+> remediation session are present, it may edit source files in the target repo.
+> To scan
 > without modifying the target: `--stop-after s9`, or use a profile with
 > `step_remediate.enabled: false`. The flag `--remediate` and config
 > `step_remediate.enabled` OR together (the flag only turns it on).
@@ -50,25 +52,37 @@ These DTOs are exactly what [`validate`](validation.md) (step 11) later grades.
 | Mode | Effect |
 |---|---|
 | `fix` *(default)* | Applies the minimal diff to the working tree via `Edit`/`Write` (cwd-confined). The in-scan Step-10 path always uses this. |
-| `report-only` | Proposes the fix and writes the DTO; the agent is instructed not to edit files. Note: the edit tools are still in `allowed_tools` — the no-edit behavior is prompt-enforced, not withheld at the tool layer. |
+| `report-only` | Proposes the fix and writes the DTO; the agent is instructed not to edit files. DeepAgents additionally withholds filesystem writes at the tool-permission layer; legacy routes retain their existing prompt-enforced behavior. |
 
-> ⚠️ **Fix mode needs an Anthropic backend (`via: cli` or `via: sdk`).** Applying
-> a fix requires the file-mutation tools (`Edit`/`Write`), which only the `cli`
-> and `sdk` backends provide. The OpenAI-compatible backend is sandboxed to
+> ⚠️ **Fix mode needs a write-capable backend (`via: cli`, `via: sdk`, or
+> `via: deepagents`).** DeepAgents uses a real filesystem rooted at the target
+> repository with traversal-safe virtual paths and no shell backend. The legacy
+> OpenAI-compatible backend is sandboxed to
 > `Read`/`Glob`/`Grep` and cannot edit files, so a `via: openai`
 > `models.remediate` role can only do useful work in `--mode report-only` — in
 > fix mode it has no edit tool, so each finding errors and the remediation step
 > exits non-zero (not a silent no-op). The shipped `default.yaml` uses an
-> Anthropic `via: cli` remediate role, so fix mode works out of the box. See
+> Anthropic `via: deepagents` remediate role, so fix mode uses its repo-confined
+> filesystem backend. See
 > [models.md](models.md).
 
 The tool set is `Read / Glob / Grep / Edit / Write` — **Bash is intentionally
 omitted** (a prompt-injected agent with a host shell would be RCE on the
-scanner). How that exclusion is enforced depends on the route: on `via: sdk`
-the Agent SDK permission gate denies Bash even if it is re-added to
-`allowed_tools`; on the **default `via: cli` route there is no such gate** —
-Bash is contained only by its absence from `allowed_tools`, so re-adding it
-*would* grant a host shell. Don't.
+scanner). How that exclusion is enforced depends on the route: on `via: deepagents`
+the permission gate is enforced at the tool layer; on `via: sdk` the Agent SDK
+permission gate denies Bash even if it is re-added to `allowed_tools`; the
+`via: cli` route has no such gate — Bash is contained only by its absence from
+`allowed_tools`, so re-adding it *would* grant a host shell. Don't.
+
+The default profile routes remediation and validation through DeepAgents per
+model: set `via: deepagents` plus `provider: anthropic` or `provider: openai`
+on the `models.remediate` / `models.validate` role.
+- `provider: anthropic` — Anthropic Messages API (`ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`).
+- `provider: openai` — OpenAI Chat Completions API (`OPENAI_API_KEY`). Also
+  accepts **any OpenAI-compatible endpoint** (open-weight models via vLLM,
+  Together AI, Ollama, Azure OpenAI, etc.) by setting `OPENAI_BASE_URL` to
+  your endpoint. When `provider` is omitted, the backend infers from the model
+  name (`claude-*` → Anthropic, anything else → OpenAI-compatible).
 
 ## Running it standalone
 
@@ -94,13 +108,13 @@ vvaharness remediate --repo /path/to/target --top 10 -i --mode report-only
 
 | Key | Default | Effect |
 |---|---|---|
-| `enabled` | `true` | Run the Remediation Agent (also as Step 10 of a scan). `--remediate` forces on. |
-| `top_n_findings` | `5` | Cap by CVSS; `--top` overrides; `all`/`*`/`null` = every finding. |
-| `max_budget_usd` | `10.0` | Per-repo soft cap (token accounting). |
-| `max_turns` | `40` | Tool-loop cap for `via: sdk` / `via: openai`. |
+| `enabled` | `true` in default/sdk/full; `false` in taint | Run the Remediation Agent (also as Step 10 of a scan). `--remediate` forces on. |
+| `top_n_findings` | `5` in default/sdk/taint; `20` in full | Cap by CVSS; `--top` overrides; `all`/`*`/`null` = every finding. |
+| `max_budget_usd` | `10.0` | Per-finding cap passed to the backend. Compatible Claude CLI and Claude Agent SDK routes enforce it; raw SDK/OpenAI and DeepAgents routes ignore it. Token accounting does not enforce this value. |
+| `max_turns` | `40` | Per-finding loop cap: forwarded to compatible Claude CLI builds and Claude Agent SDK, enforced by raw SDK/OpenAI loops, and mapped to a DeepAgents recursion limit. |
 | `allowed_tools` | `[Read, Glob, Grep, Edit, Write]` | Fix-mode tools; Bash denied. |
-| `enforce_policy` | `false` | Opt-in deny-list/playbook gate + diff post-gate (reverts forbidden-path edits). |
-| `policy_file` / `playbook_file` | shipped `inputs/` | Override paths to `remediation_policy.yaml` / `remediation_playbook.yaml`. |
+| `enforce_policy` | `true` in `default.yaml` / `taint.yaml`; `false` in `sdk.yaml` / `full.yaml` | Opt-in deny-list/playbook gate + diff post-gate (reverts forbidden-path edits). |
+| `policy_file` / `playbook_file` | bundled files when unset/unresolved | Optional paths under `step_remediate` to `remediation_policy.yaml` / `remediation_playbook.yaml`; paths resolve relative to the active config. |
 
 ## Policy gate & kill-switch (`enforce_policy: true`)
 
@@ -121,8 +135,8 @@ enforced when `enforce_policy: true`.
 ## Output & safety summary
 
 - Writes `<repo>/security-remediation/<NN_slug>/{remediate_report.json, evidence/}`.
-- In **fix mode**, also edits source files in the target repo — only run against
-  repos you authored/trust (see [security.md](security.md)).
+- In **fix mode**, a successful remediation may edit source files in the target
+  repo — only run against repos you authored/trust (see [security.md](security.md)).
 - `--resume` skips findings already remediated in a prior run. (Note: `--force`
   is a *scan* flag that overrides the s10 git-SHA staleness check, not a
   remediate re-run flag.)

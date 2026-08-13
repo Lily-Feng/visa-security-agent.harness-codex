@@ -14,18 +14,22 @@
 
 """Domain enums for vvaharness.validation.
 
-Convention: value-enums subclass ``StrEnum`` (via ``._compat``) so ``Member == "value"``
+Convention: value-enums subclass ``enum.StrEnum`` so ``Member == "value"``
 holds; reserve a bare ``Enum`` only for a discriminator never compared to a string. All
 value-enums here are ``StrEnum``.
 """
 
 from __future__ import annotations
 
-from .effort import EffortLevel
+# EffortLevel/SettingSource are agent-backend vocabularies; they live in the shared
+# harness contract and are re-exported here so validation config code keeps a single
+# import site for its enum vocabulary.
+from vvaharness.backends.harness.contract.effort import EffortLevel
+from vvaharness.backends.harness.contract.setting_source import SettingSource
+
 from .gates import GateName, GateStatus
 from .paths import ValidationPath
 from .readiness import MergeReadiness
-from .setting_source import SettingSource
 from .verdicts import Answer, FixVerdict
 
 __all__ = [

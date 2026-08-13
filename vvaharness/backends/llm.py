@@ -34,6 +34,18 @@ from vvaharness.backends import claude_cli as cli, sdk, oai
 from vvaharness.backends.claude_cli import parse_json_response  # noqa: F401
 from vvaharness.util.tokens import TOKENS  # noqa: F401
 
+# The hoisted DeepAgents harness is integrated only at the two post-scan seams.
+# S1–S9 continue to use the legacy prompt/agentic dispatcher backends.
+DEEPAGENTS_ROLES = frozenset({"remediate", "validate"})
+
+# Roles that run AFTER detection completes (S10 remediate, S11 validate) and are
+# individually profile-controlled. A missing credential for one of these degrades
+# that stage only, so startup preflight warns instead of aborting the whole scan;
+# the S10/S11 gates in orchestrator.scan then disable the stage. Same members as
+# DEEPAGENTS_ROLES today but a different question — which backend a role may use vs.
+# when in the pipeline it runs — so the two are kept separate on purpose.
+POST_SCAN_ROLES = frozenset({"remediate", "validate"})
+
 
 def resolve(model_cfg: Any) -> tuple[str, str, dict]:
     """

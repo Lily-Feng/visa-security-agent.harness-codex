@@ -398,6 +398,12 @@ def test_md_cell_escapes_pipe_and_newline():
     assert _md_cell(None) == ""
 
 
+def test_md_cell_escapes_backslash_before_pipe():
+    # A supplied "\" must be doubled, else it consumes the escape added for "|" and the
+    # raw delimiter survives into the rendered table.
+    assert _md_cell(r"a\|b") == r"a\\\|b"
+
+
 def test_to_markdown_demotes_injected_verifier_heading():
     f = _minimal_finding(
         verdict="TRUE_POSITIVE", verdict_confidence=8, verdict_reason="confirmed",
